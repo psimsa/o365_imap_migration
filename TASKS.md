@@ -57,12 +57,15 @@ Remote: `origin` -> `git@github.com:psimsa/o365_imap_migration.git` (fork)
 
 ## Planned: interactive mode (`-i`)
 
-Spec: [docs/interactive-tui-spec.md](docs/interactive-tui-spec.md) (awaiting review)
+Spec: [docs/interactive-tui-spec.md](docs/interactive-tui-spec.md) (reviewed)
 
 - [ ] Optional `--interactive` / `-i` wizard for a single mailbox.
 - [ ] Verify (and optionally persist) Graph credentials from `.env`.
 - [ ] Account statistics + migration plan preview.
 - [ ] Folder / message-limit scope selection.
 - [ ] IMAP credential validation and root-only parent-folder picker with fuzzy input.
-- [ ] Explicit confirmation, then run dry-run or migration; optional CSV row append.
-- [ ] Optional TUI dependencies (`requirements-tui.txt`), tests and docs.
+- [ ] Read-only validation screen (Graph creds, mailbox, sample message, IMAP, folder
+      plan) instead of a dry-run action; migration only after an explicit `yes`
+      (confirmation defaults to No).
+- [ ] Optional CSV row append; optional TUI dependencies (`requirements-tui.txt`),
+      tests and docs.
