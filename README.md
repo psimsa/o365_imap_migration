@@ -93,23 +93,23 @@ The wizard handles **one mailbox** per run:
 2. verify the Graph app credentials from `.env`, prompting (hidden input) if they are
    missing or rejected, with an optional, atomic write-back to `.env`;
 3. show account statistics (folders, message counts, sizes);
-4. choose all folders or a subset (a parent also selects its subfolders), an optional
-   message limit and an optional received-date range;
-5. ask for the target IMAP credentials and verify the login with TLS; for a manually
+4. ask for the target IMAP credentials and verify the login with TLS — a password
+   stored in `details.csv` is used only after an explicit confirmation; for a manually
    entered mailbox it also asks whether to save the row to `details.csv` (written
    before migration, so the restart command works);
-6. optionally mirror the folder tree under a root-level target folder: a numbered menu
+5. optionally mirror the folder tree under a root-level target folder: a numbered menu
    when the target has fewer than 10 root folders, otherwise a fuzzy typeahead input;
-   a non-matching name is created;
-7. ask whether to record progress for resuming an interrupted run (default on when a
-   session exists; an existing session can be kept, or deleted and restarted), then
-   show a **validation screen** (Graph auth, mailbox access, one sample message, IMAP
+   a non-matching name is created (surrounding quotes are stripped);
+6. ask whether to record progress for resuming an interrupted run (default on when a
+   session exists; an existing session can be kept, or deleted and restarted);
+7. choose all folders or a subset (a parent also selects its subfolders), an optional
+   message limit and an optional received-date range;
+8. show a **validation screen** (Graph auth, mailbox access, one sample message, IMAP
    login, folder plan, resume state) and the final plan — including the exact
    **restart command** to resume with if the run is interrupted — then ask for
-   confirmation.
-   The confirmation defaults to **No** and only an explicit `y`/`yes` starts the
-   migration;
-8. migrate (streaming), report `migrated`/`failed`, and print the restart command again.
+   confirmation. The confirmation defaults to **No** and only an explicit `y`/`yes`
+   starts the migration;
+9. migrate (streaming), report `migrated`/`failed`, and print the restart command again.
 
 The validation screen is the interactive dry run: nothing is fetched in bulk and nothing
 is written until the explicit confirmation. `--dry-run` is therefore not needed with `-i`

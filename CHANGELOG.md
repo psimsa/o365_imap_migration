@@ -76,6 +76,21 @@ Planned release: `1.1.0`. Everything below is on `feature/interactive-tui`
 
 ### Fixed
 
+- Wizard step numbers now follow the execution order (the scope step runs after the
+  resume step so it can be re-asked when validation fails), and the validation /
+  confirmation screen is a numbered step of its own.
+- A `details.csv` password is no longer used silently: the wizard asks
+  "Use the password stored in details.csv?" before using it (default yes), and the
+  spec was corrected to match.
+- `MigrationSession.load` discards a session file without a valid header instead of
+  appending to it forever (previously such a file could never resume).
+- `migrate_mailbox` returns `None` when a run cannot complete (auth/connect/exception);
+  batch mode aggregates per-mailbox outcomes and exits `1` if any mailbox had failures
+  or could not run, instead of always exiting `0`.
+- Two threads migrating the same source mailbox no longer race on the shared
+  `tokens/token_<email>/` directory (authentication is serialized per process).
+- The folder plan counts parent components (e.g. `Migration` itself), matching the
+  `CREATE` commands actually issued.
 - Attached emails (`itemAttachment`, e.g. a `.eml` attachment) were skipped with
   "Skipping attachment without content". Attachments are now listed with
   `$expand=microsoft.graph.itemAttachment/item`; the attached message is rebuilt and

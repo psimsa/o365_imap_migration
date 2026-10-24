@@ -93,6 +93,22 @@ Remote: `origin` -> `git@github.com:psimsa/o365_imap_migration.git` (fork)
 - [x] Clearer warning for attachments with no downloadable content.
 - [x] Tests for item/reference attachments and the `$expand` request.
 
+## Review round 1 (fixes applied)
+
+- [x] Wizard step order/numbering corrected (9 steps, validation is its own step);
+      spec and README reordered to match (IMAP before scope: fail fast on the target).
+- [x] CSV-stored IMAP password now requires an explicit confirmation prompt.
+- [x] `migrate_mailbox` returns `None` on hard failure; batch exit code reflects
+      failures (`1` if any mailbox failed or could not run).
+- [x] Headerless/corrupt session files are discarded (and recreated with a header)
+      instead of being appended to forever.
+- [x] Authentication serialized with a lock (same source in two CSV rows no longer
+      races on `tokens/token_<email>/`).
+- [x] Plan "to create" counts parent components, matching issued CREATEs.
+- [x] Non-ASCII headers verified: stdlib already emits RFC 2047 subjects and RFC 2231
+      filenames, and both round-trip; no change needed (documented as verified).
+- [x] 50 tests pass on CPython 3.14.6 and 3.12.3.
+
 ## Next / open questions
 
 - [ ] Run a real end-to-end trial (`--dry-run`, then `--limit 25`) and tag `1.1.0`.

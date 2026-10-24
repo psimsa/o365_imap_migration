@@ -70,7 +70,10 @@ python o365_imap_migration.py -i --env-file .env.staging --csv details.prod.csv
 
 ## 4. Wizard flow
 
-Eight steps; each prints a step header. No secrets are ever echoed to the screen or logs.
+Nine steps, executed in the order below; each prints a step header. No secrets are ever
+echoed to the screen or logs. Steps are ordered so that failures surface early: the
+target IMAP login is verified before the user spends time choosing a scope, and the
+scope step is re-asked if validation fails.
 
 ### Step 1 — Source mailbox
 
@@ -120,33 +123,20 @@ Account statistics
 
 - If the mailbox has no folders, report it and offer to abort.
 
-### Step 4 — Scope
+### Step 4 — Target IMAP
 
-Two questions, defaults from CLI/env:
+- Fields: server, address, password (hidden). Server/address are prefilled from the
+  chosen CSV row; the password is taken from the CSV row only after an explicit
+  "Use the password stored in details.csv?" confirmation (default yes), otherwise it
+  is asked with hidden input. Passwords are never echoed, logged or stored in `.env`.
+- Connect with the existing `connect_to_target_imap` (TLS verified). On failure show
+  the error and allow retry/abort. Warn loudly if `IMAP_SSL_VERIFY=false` in `.env`.
+- After login, read `get_imap_hierarchy` (delimiter + mailboxes) — used in Step 5.
+- If the mailbox was entered manually, ask (after the plan, Step 8) whether to save
+  the row to `details.csv`; default **No**. The row is written before migration starts
+  (mode `0600`), so the restart command works after an interrupt.
 
-1. **Folders**: radio `All folders (N)` / `Choose folders…`.
-   - "Choose folders" shows a checkbox list of all folder paths (searchable by typing).
-     Selecting a parent selects its subtree (same semantics as `--folders`).
-2. **Message limit**: `All messages` / `Newest N messages…` (positive integer; empty
-   means all).
-3. **Received-date range** (optional): "Filter by received date?" then `after` and/or
-   `before` (`YYYY-MM-DD` or ISO-8601, UTC; empty means unbounded). The range is
-   validated (`after < before`).
-
-The effective values are stored in a copy of `Config` (`migrate_folders`,
-`migrate_limit`, `migrate_after`, `migrate_before`).
-
-### Step 5 — Target IMAP
-
-- Fields: server, address, password (hidden). Prefilled from the chosen CSV row when
-  available; password always asked (never stored in the config).
-- Connect with the existing `connect_to_target_imap` (TLS verified). On failure show the
-  error and allow retry/abort. Warn loudly if `IMAP_SSL_VERIFY=false` in `.env`.
-- After login, read `get_imap_hierarchy` (delimiter + mailboxes) — used in Step 6.
-- If the mailbox was entered manually, ask (after the plan, Step 7) whether to append it to
-  `details.csv`; default **No**, and never write the password to logs.
-
-### Step 6 — Target parent folder
+### Step 5 — Target parent folder
 
 Question: `Mirror the folder tree under an existing/new target folder?`
 
@@ -161,33 +151,55 @@ Question: `Mirror the folder tree under an existing/new target folder?`
   - **If candidates ≥ 10**: free-text input with fuzzy autocomplete ("whisper" =
     typeahead suggestions while typing, `prompt_toolkit` fuzzy completer). Typing a
     non-matching name is accepted.
-  - Values are trimmed; a value containing the hierarchy delimiter is rejected with an
-    explanation (single root folder only).
-  - If the input matches a candidate (case-insensitive) → existing folder is reused; the
-    plan says `reuse existing`. Otherwise → `will be created`.
+  - Values are trimmed, a single pair of surrounding quotes is stripped
+    (`'Office Migration'` → `Office Migration`), and a value containing the hierarchy
+    delimiter is rejected with an explanation (single root folder only).
+  - If the input matches a candidate (case-insensitive) → existing folder is reused;
+    the plan says `reuse existing`. Otherwise → `will be created`.
 - Either way the choice is stored in `cfg.target_parent_folder`.
 
-### Step 7 — Resume, validation, final plan and confirmation
+### Step 6 — Resume
 
-Before validating, the wizard asks whether to record progress so an interrupted run can
-resume (`restartable`). The default is **on** when a session file already exists for the
+The wizard asks whether to record progress so an interrupted run can resume
+(`restartable`). The default is **on** when a session file already exists for the
 chosen source/target/parent folder. An existing session is reported with its recorded
 message count and can be kept (resume) or deleted (start over); an incompatible session
 (wrong target/parent) offers to be deleted or disables restart for this run.
+`--reset-session` short-circuits to deletion.
+
+### Step 7 — Scope
+
+Three questions, defaults from CLI/env:
+
+1. **Folders**: radio `All folders (N)` / `Choose folders…`.
+   - "Choose folders" shows a checkbox list of all folder paths (searchable by typing).
+     Selecting a parent selects its subtree (same semantics as `--folders`).
+2. **Message limit**: `All messages` / `Newest N messages…` (positive integer; empty
+   means all).
+3. **Received-date range** (optional): "Filter by received date?" then `after` and/or
+   `before` (`YYYY-MM-DD` or ISO-8601, UTC; empty means unbounded). The range is
+   validated (`after < before`).
+
+The effective values are stored in a copy of `Config` (`migrate_folders`,
+`migrate_limit`, `migrate_after`, `migrate_before`).
+
+### Step 8 — Validation, final plan and confirmation
 
 This step replaces a separate dry-run action. It performs the read-only checks the
 migration depends on (without fetching or writing the mailbox) and shows the resulting
-plan. **If any check fails, migration cannot start** — the user can go back or abort.
+plan. **If any check fails, migration cannot start** — the user can go back to Step 7
+or abort.
 
 Read-only checks, using the credentials and target connection already established:
 
 - Graph app token valid for the tenant.
 - Mailbox readable and the selected folders resolvable.
 - One sample message from the selection can be read and converted (`html`/`plain`,
-  attachments setting), proving message/attachment access.
-- Target IMAP login and TLS verification (already done in Step 5, shown again).
-- Folder plan: how many target folders will be created vs reused, and warnings
-  (e.g. `Junk Email → INBOX` when the target has no `Spam` folder).
+  attachments setting), proving message/attachment access. Inbox is preferred.
+- Target IMAP login and TLS verification (already done in Step 4, shown again).
+- Folder plan: how many target folders will be created vs reused (parents included),
+  and warnings (e.g. `Junk Email → INBOX` when the target has no `Spam` folder).
+- Resume session state (recorded message count) when restartable.
 
 ```
 Validation & plan
@@ -220,15 +232,13 @@ Start the migration? [y/N]
 - If validation found a failure, replace the confirmation prompt with
   `Back to the previous step? [Y/n]` / `Abort [a]`.
 
-### Step 8 — Execute
+### Step 9 — Execute
 
 - Register a `ProgressBoard` (single row) and call `migrate_mailbox(cfg, mailbox, board)`;
   print the final `migrated / failed` summary.
-- Exit `0` only when `failed == 0`; exit `1` when any message failed.
-- On success, if the mailbox was entered manually and the user agreed in Step 5, append the
-  row to `details.csv` (header created if the file is new; file mode `0600`).
-- Final line: counts, elapsed time, and the exact command to rerun the same migration
-  non-interactively (useful for automation).
+- Exit `0` when the run completed with `failed == 0`; exit `1` when the run could not
+  be completed (`migrate_mailbox` returned `None`) or any message failed.
+- Final line: counts, elapsed time, and the restart command again.
 
 ## 5. Components
 
