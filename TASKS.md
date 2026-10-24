@@ -126,6 +126,28 @@ Remote: `origin` -> `git@github.com:psimsa/o365_imap_migration.git` (fork)
       round-trip verified clean; 18/18 folder names round-trip through UTF-7.
 - [ ] End-to-end `--verify` against a real IMAP target (needs IMAP credentials).
 
+## Tier 1 performance (implemented)
+
+- [x] Per-thread keep-alive `requests.Session` (connection pool) for all Graph calls.
+- [x] Message pages use `$select` (only needed properties) and, with attachments
+      on, `$expand=attachments($expand=microsoft.graph.itemAttachment/item)`:
+      attachment content arrives inline - one request per page, not per message.
+- [x] 504 (page too large) halves `$top` and retries (floor 10).
+- [x] Attachments without inline `contentBytes` are fetched via `$value` in
+      `$batch` groups of 20; empty results (broken inline images) are reported
+      and skipped, never fatal; itemAttachments without inline `item` are expanded
+      individually.
+- [x] 13 new tests (request shape, no per-message GETs, batch fallback + chunking,
+      zero-byte handling, item expansion, 504 shrink, top helpers). 91 total pass
+      on CPython 3.14.6 and 3.12.3.
+- [x] Live checks on pavel@simsa.cz: `$expand`+`$filter`+`$select` all 200;
+      11.3 MB attachment arrives inline and converts to a 12.4 MB ASCII-only
+      message; broken inline image (obrazek.png, 0-byte $value) is reported and
+      skipped without failing the message.
+- [x] Measured: 300 Inbox messages fetched+converted in 9.2s = 32.4 msg/s
+      (previously ~3 msg/s end-to-end). Remaining serial costs: conversion CPU and
+      the IMAP APPEND round trip - those are tier 2 (pipeline).
+
 ## Next / open questions
 
 - [ ] Run a real end-to-end trial (`--dry-run`, then `--limit 25`) and tag `1.1.0`.

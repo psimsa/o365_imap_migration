@@ -44,7 +44,7 @@ Planned release: `1.1.0`. Everything below is on `feature/interactive-tui`
   Confirmation defaults to **No** and no message is written before an explicit `yes`.
 - Optional TUI dependencies in `requirements-tui.txt` (`rich`, `prompt_toolkit`); batch
   mode does not import them.
-- Unit-test suite (27 tests, hermetic fake Graph/IMAP backends) and a GitHub Actions
+- Unit-test suite (91 tests, hermetic fake Graph/IMAP backends) and a GitHub Actions
   workflow running it on Python 3.10, 3.12 and 3.14.
 - `--dry-run`: authenticates against Graph, lists source folders, reads and converts one
   real message, logs in to every target IMAP server (TLS verified) and reports the folder

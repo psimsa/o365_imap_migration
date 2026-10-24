@@ -76,6 +76,10 @@ python o365_imap_migration.py --target-parent-folder "Migration 2026"
 # Only Inbox, Sent Items and the Archive/2024 subtree, at most 500 messages each.
 python o365_imap_migration.py --folders "Inbox,Sent Items,Archive/2024" --limit 500
 
+# Same, resuming an interrupted run and verifying afterwards.
+python o365_imap_migration.py --folders Inbox --restartable
+python o365_imap_migration.py --verify
+
 # Trial run of 25 newest Inbox messages into a scratch folder.
 python o365_imap_migration.py --target-parent-folder Scratch --folders Inbox --limit 25
 ```
@@ -168,6 +172,20 @@ Other `.env` settings: `MIGRATE_ATTACHMENTS` (default **on**), `EMAIL_FORMAT`
 - **Paging:** Graph returns 10 items per page by default. The script sets `$top`
   (`GRAPH_PAGE_SIZE`) and follows `@odata.nextLink` until every folder and
   message has been read; 429/5xx responses are retried honouring `Retry-After`.
+  Message pages are requested with `$select` (only the properties the converter
+  needs) and, when attachments are enabled, `$expand=attachments` so attachment
+  content arrives inline - **one request per page instead of one request per
+  message**. A 504 (page too large) halves `$top` and retries.
+- **Attachments:** file attachments come inline with the page (`contentBytes`).
+  Attachments Graph returns without content (large files, some broken inline
+  images) are fetched with `$value` in `$batch` groups of up to 20; attachments
+  that still have no content (Graph returns 0 bytes for a few broken inline
+  images) are reported and skipped, never fatal. Attached emails
+  (`itemAttachment`) are expanded and embedded as `message/rfc822`; cloud links
+  become `.url` files.
+- **HTTP:** all Graph calls reuse per-thread keep-alive connections
+  (`requests.Session` with a connection pool) instead of a fresh TLS handshake
+  per request.
 - **Time filter:** `--after`/`--before` are applied server-side with
   `receivedDateTime ge/lt ...`, so the limit and paging work on the filtered set.
   Date-only values are UTC midnight; `--before` is exclusive. This is useful for
