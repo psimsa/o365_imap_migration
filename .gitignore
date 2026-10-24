@@ -1,0 +1,10 @@
+# Credentials and per-run data - never commit these.
+.env
+.env.*
+!.env.example
+details.csv
+tokens/
+
+# Python
+__pycache__/
+*.py[cod]
