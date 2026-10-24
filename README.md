@@ -1,5 +1,9 @@
 # o365_imap_migration
 
+> Based on the original repo
+> [ArunasVysn/o365_imap_migration](https://github.com/ArunasVysn/o365_imap_migration)
+> by [ArunasVysn](https://github.com/ArunasVysn).
+
 Migrate users and shared mailboxes from Microsoft 365 to another mail server over
 IMAP. It authenticates with an Entra app (client credentials), reads mail through
 Microsoft Graph, and appends each message to the target IMAP account.
@@ -137,7 +141,8 @@ See [CHANGELOG.md](CHANGELOG.md) for the full history. Unreleased highlights:
 
 ## Project
 
-This is a fork of
-[ArunasVysn/o365_imap_migration](https://github.com/ArunasVysn/o365_imap_migration),
-maintained at [psimsa/o365_imap_migration](https://github.com/psimsa/o365_imap_migration).
+This project is **based on**
+[ArunasVysn/o365_imap_migration](https://github.com/ArunasVysn/o365_imap_migration)
+by [ArunasVysn](https://github.com/ArunasVysn), and is maintained independently at
+[psimsa/o365_imap_migration](https://github.com/psimsa/o365_imap_migration).
 Task tracking for the current work lives in [TASKS.md](TASKS.md).
