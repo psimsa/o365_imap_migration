@@ -488,8 +488,11 @@ class MigrationSession:
                     session.ids.add(str(entry["id"]))
 
         if header is None:
-            safe_print(f"Warning: ignoring session file without header: {session.path}")
-            session.ids.clear()
+            # A file without a valid header (older version, partial write) can
+            # never be resumed safely: discard it and start clean.
+            safe_print(f"Warning: discarding session file without a valid header: "
+                       f"{session.path}")
+            session.reset()
             return session
 
         expected = (source, target, server, cfg.target_parent_folder)
@@ -954,28 +957,29 @@ def authenticate_account(cfg, target_email, force_reauth=True):
     account_tokens_dir = os.path.join(TOKENS_DIR, f"token_{target_email}")
     token_path = os.path.join(account_tokens_dir, "o365_token.txt")
 
-    if force_reauth and os.path.exists(account_tokens_dir):
-        shutil.rmtree(account_tokens_dir)
-    os.makedirs(account_tokens_dir, exist_ok=True)
-
-    account = _create_account(cfg, account_tokens_dir)
-    try:
-        authenticated = account.is_authenticated
-    except ValueError:
-        # Stale token file written by an older O365 release: start over.
-        shutil.rmtree(account_tokens_dir, ignore_errors=True)
+    with auth_lock:
+        if force_reauth and os.path.exists(account_tokens_dir):
+            shutil.rmtree(account_tokens_dir)
         os.makedirs(account_tokens_dir, exist_ok=True)
+
         account = _create_account(cfg, account_tokens_dir)
-        authenticated = False
+        try:
+            authenticated = account.is_authenticated
+        except ValueError:
+            # Stale token file written by an older O365 release: start over.
+            shutil.rmtree(account_tokens_dir, ignore_errors=True)
+            os.makedirs(account_tokens_dir, exist_ok=True)
+            account = _create_account(cfg, account_tokens_dir)
+            authenticated = False
 
-    if not authenticated:
-        safe_print(f"Authenticating against Microsoft Graph for {target_email}.")
-        if not account.authenticate():
-            raise MigrationError(f"authentication failed for {target_email}")
+        if not authenticated:
+            safe_print(f"Authenticating against Microsoft Graph for {target_email}.")
+            if not account.authenticate():
+                raise MigrationError(f"authentication failed for {target_email}")
 
-    access_token = _read_access_token(account, token_path)
-    if not access_token:
-        raise MigrationError(f"no access token available for {target_email}")
+        access_token = _read_access_token(account, token_path)
+        if not access_token:
+            raise MigrationError(f"no access token available for {target_email}")
 
     safe_print(f"Successfully authenticated for {target_email}.")
     return access_token, account
@@ -1243,7 +1247,10 @@ def migrate_emails(cfg, target_mail, messages, board=None, key=None, session=Non
 
 
 def migrate_mailbox(cfg, mailbox, board=None):
-    """Migrates a single mailbox and returns (migrated, failed).
+    """Migrates a single mailbox.
+
+    Returns ``(migrated, failed)`` for a completed run (possibly zero messages),
+    or ``None`` when the run could not be completed (auth/connect/exception).
 
     Messages are streamed: each page is fetched, then converted and appended
     immediately, so the target starts receiving mail while the source is still
@@ -1279,34 +1286,21 @@ def migrate_mailbox(cfg, mailbox, board=None):
                                              target_password)
         if target_mail is None:
             safe_print(f"[{source_email}] failed to connect to target IMAP server {target_server}")
-            return 0, 0
+            return None
 
-        state, warned = prepare_target_state(target_mail)
         if board is not None:
             key = board.register(source_email, total)
 
-        migrated = failed = 0
-        current_folder = None
         try:
-            for message in iter_source_emails(
+            # migrate_emails iterates lazily, so the generator streams: each page
+            # is fetched, converted and appended before the next page is requested.
+            migrated, failed = migrate_emails(
+                cfg, target_mail,
+                iter_source_emails(
                     cfg, source_email, access_token,
                     skip_ids=session.ids if session is not None else None,
-                    folders=folders):
-                ok, display_folder = migrate_one(cfg, target_mail, message, state, warned)
-
-                if (board is not None and key is not None and display_folder
-                        and display_folder != current_folder):
-                    current_folder = display_folder
-                    board.set_folder(key, display_folder)
-
-                if ok:
-                    migrated += 1
-                    if session is not None:
-                        session.record(message.get("id"), display_folder)
-                else:
-                    failed += 1
-                if board is not None and key is not None:
-                    board.advance(key, ok)
+                    folders=folders),
+                board=board, key=key, session=session)
         finally:
             try:
                 target_mail.logout()
@@ -1331,7 +1325,7 @@ def migrate_mailbox(cfg, mailbox, board=None):
         if board is not None and key is not None:
             board.finish(key, "failed")
         safe_print(f"[{source_email}] migration failed: {e}")
-        return 0, 0
+        return None
     finally:
         if session is not None:
             session.close()
@@ -1584,9 +1578,17 @@ def main(argv=None):
 
         board = ProgressBoard()
         _active_board = board
+        outcomes = []
+        outcomes_lock = threading.Lock()
+
+        def run_one(mailbox):
+            outcome = migrate_mailbox(cfg, mailbox, board)
+            with outcomes_lock:
+                outcomes.append(outcome)
+
         threads = []
         for mailbox in mailboxes:
-            thread = threading.Thread(target=migrate_mailbox, args=(cfg, mailbox, board))
+            thread = threading.Thread(target=run_one, args=(mailbox,))
             threads.append(thread)
             thread.start()
 
@@ -1594,6 +1596,12 @@ def main(argv=None):
             thread.join()
         _active_board = None
 
+        broken = [outcome for outcome in outcomes
+                  if outcome is None or outcome[1] > 0]
+        if broken:
+            print(f"Migration finished with errors in {len(broken)} of "
+                  f"{len(outcomes)} mailbox(es).")
+            return 1
         print("All mailboxes have been migrated.")
         return 0
     except KeyboardInterrupt:

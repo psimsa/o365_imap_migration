@@ -237,7 +237,7 @@ class FlowTests(unittest.TestCase):
         restart_index = next(index for index, line in enumerate(self.renderer.lines)
                              if "Restart command" in line)
         execute_index = next(index for index, line in enumerate(self.renderer.lines)
-                             if "Step 8/8" in line)
+                             if "Step 9/9" in line)
         self.assertLess(restart_index, execute_index)
         self.assertTrue(any("Time filter" in line for line in self.renderer.lines))
         self.assertTrue(any("Restartable" in line for line in self.renderer.lines))
@@ -254,6 +254,43 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(cfg_used.migrate_after, "2020-01-01T00:00:00Z")
         self.assertEqual(cfg_used.migrate_before, "2021-01-01T00:00:00Z")
         self.assertTrue(any("after 2020-01-01" in line
+                            for line in self.renderer.lines))
+
+    def test_csv_password_is_used_after_confirmation(self):
+        csv_path = os.path.join(self.tmp.name, "details.csv")
+        with open(csv_path, "w", encoding="utf-8") as handle:
+            handle.write(",".join(mig.CSV_HEADER) + "\n")
+            handle.write("user@contoso.com,imap.example.com,target@example.com,"
+                         "csv-password\n")
+        self.cfg = support.make_cfg(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+            csv_file=csv_path)
+        self._patch_world()
+        answers = [
+            0,        # pick the CSV row
+            False,    # do not change target
+            True,     # use the password stored in details.csv
+            False,    # mirror under parent folder
+            False,    # do not resume
+            0,        # all folders
+            False,    # no message limit
+            False,    # no date filter
+            True,     # start
+        ]
+        prompter = tui.ScriptedPrompter(answers)
+        rc = tui.run_interactive(self.args, prompter, self.renderer)
+        self.assertEqual(rc, 0, self.renderer.lines)
+        mailbox = mig.migrate_mailbox.call_args.args[1]
+        self.assertEqual(mailbox[3], "csv-password")
+
+    def test_migrate_mailbox_none_marks_failure(self):
+        self._patch_world()
+        mig.migrate_mailbox.return_value = None
+        answers = self._answers() + [True]
+        prompter = tui.ScriptedPrompter(answers)
+        rc = tui.run_interactive(self.args, prompter, self.renderer)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("could not be completed" in line
                             for line in self.renderer.lines))
 
     def test_resume_prompt_enables_restartable(self):

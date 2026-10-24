@@ -380,6 +380,8 @@ def plan_targets(cfg, folders, delimiter, existing_names):
     if cfg.target_parent_folder:
         for folder in folders:
             path = mig.build_target_path(cfg, folder["path"], delimiter)
+            # Count every component (parents included), matching what
+            # ensure_target_folder actually issues CREATE for.
             current = ""
             for part in path.split(delimiter):
                 current = part if not current else f"{current}{delimiter}{part}"
@@ -591,7 +593,7 @@ class Wizard:
     # -- steps -------------------------------------------------------------
 
     def step_mailbox(self):
-        self.renderer.step(1, 8, "Source mailbox")
+        self.renderer.step(1, 9, "Source mailbox")
         rows = []
         if os.path.exists(self.cfg.csv_file):
             try:
@@ -617,11 +619,11 @@ class Wizard:
             self.mailbox = MailboxChoice(source_email)
 
     def step_credentials(self):
-        self.renderer.step(2, 8, "Microsoft Graph credentials")
+        self.renderer.step(2, 9, "Microsoft Graph credentials")
         self.cfg = credentials_flow(self.cfg, self.prompter, self.renderer, self.env_path)
 
     def step_stats(self):
-        self.renderer.step(3, 8, "Account statistics")
+        self.renderer.step(3, 9, "Account statistics")
         try:
             self.access_token, _ = mig.authenticate_account(
                 self.cfg, self.mailbox.source_email, force_reauth=False)
@@ -639,7 +641,7 @@ class Wizard:
             self.renderer.warn("the mailbox appears to be empty")
 
     def step_scope(self):
-        self.renderer.step(4, 8, "Scope")
+        self.renderer.step(7, 9, "Scope")
         paths = [folder["path"] for folder in self.folders]
         prefilled = {name.strip().lower() for name in self.cfg.migrate_folders}
         preselected = tuple(index for index, folder in enumerate(self.folders)
@@ -703,7 +705,7 @@ class Wizard:
         )
 
     def step_imap(self):
-        self.renderer.step(5, 8, "Target IMAP")
+        self.renderer.step(4, 9, "Target IMAP")
         server = self.mailbox.target_server
         target = self.mailbox.target_email
         password = self.mailbox.password
@@ -712,6 +714,9 @@ class Wizard:
             if self.prompter.confirm(f"Target is {target} @ {server}. Change it?",
                                      default=False):
                 server = target = password = ""
+            elif password and not self.prompter.confirm(
+                    "Use the password stored in details.csv?", default=True):
+                password = ""
         if not server:
             server = self.prompter.text("IMAP server", default=server,
                                         validate=lambda v: v or _raise("enter a server"))
@@ -744,7 +749,7 @@ class Wizard:
                                target_email=target, password=password)
 
     def step_parent(self):
-        self.renderer.step(6, 8, "Target parent folder")
+        self.renderer.step(5, 9, "Target parent folder")
         if not self.prompter.confirm(
                 "Mirror the O365 folder tree under a target folder?",
                 default=bool(self.cfg.target_parent_folder)):
@@ -777,7 +782,7 @@ class Wizard:
                            f"({'existing' if matched else 'will be created'})")
 
     def step_resume(self):
-        self.renderer.step(7, 8, "Resume & validation")
+        self.renderer.step(6, 9, "Resume")
         mailbox = (self.mailbox.source_email, self.mailbox.target_server,
                    self.mailbox.target_email, self.mailbox.password)
 
@@ -915,7 +920,7 @@ class Wizard:
         return build_rerun_command(self.cfg, self.env_path)
 
     def execute(self):
-        self.renderer.step(8, 8, "Migration")
+        self.renderer.step(9, 9, "Migration")
         self.close()
 
         if self.save_row and not self.mailbox.from_csv:
@@ -934,7 +939,7 @@ class Wizard:
         mig._active_board = board
         started = time.time()
         try:
-            migrated, failed = mig.migrate_mailbox(
+            outcome = mig.migrate_mailbox(
                 self.cfg,
                 (self.mailbox.source_email, self.mailbox.target_server,
                  self.mailbox.target_email, self.mailbox.password),
@@ -944,6 +949,11 @@ class Wizard:
             mig._active_board = previous_board
 
         elapsed = time.time() - started
+        if outcome is None:
+            self.renderer.error(f"Migration could not be completed after "
+                                f"{elapsed:.1f}s (see the messages above).")
+            return 1
+        migrated, failed = outcome
         self.renderer.info(f"Migration finished in {elapsed:.1f}s: "
                            f"{migrated} migrated, {failed} failed.")
 
@@ -962,6 +972,7 @@ class Wizard:
 
         while True:
             self.step_scope()
+            self.renderer.step(8, 9, "Validation & confirmation")
             checks, plan = self.validate_and_plan()
             self.renderer.plan(checks, plan)
             if all(check.ok for check in checks):

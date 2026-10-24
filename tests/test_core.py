@@ -143,6 +143,35 @@ class CoreTests(unittest.TestCase):
             limit=1, skip_ids={"m1", "m2"})
         self.assertEqual([item["id"] for item in messages], ["m3"])
 
+    def test_headerless_session_file_is_discarded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = support.make_cfg(restartable=True, session_dir=tmp)
+            mailbox = ("u@example.com", "imap.example.com", "t@example.com", "pw")
+            path = mig.session_path(cfg, mailbox)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"id": "m1"}) + "\n")  # no header line
+            session = mig.MigrationSession.load(cfg, mailbox)
+            self.assertEqual(session.ids, set())
+            self.assertFalse(os.path.exists(path))  # discarded, not appended to
+            session.record("m2", "Inbox")
+            session.close()
+            reloaded = mig.MigrationSession.load(cfg, mailbox)
+            self.assertEqual(reloaded.ids, {"m2"})
+            reloaded.close()
+
+    def test_migrate_mailbox_returns_none_when_target_unreachable(self):
+        with mock.patch.object(mig, "authenticate_account",
+                               return_value=("token", None)), \
+                mock.patch.object(mig, "get_mail_folders",
+                                  return_value=support.sample_folders()), \
+                mock.patch.object(mig, "connect_to_target_imap",
+                                  return_value=None):
+            outcome = mig.migrate_mailbox(
+                self.cfg, ("u@example.com", "imap.example.com",
+                           "t@example.com", "pw"))
+        self.assertIsNone(outcome)
+
     def test_session_roundtrip_reset_and_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = support.make_cfg(restartable=True, session_dir=tmp)
