@@ -151,7 +151,9 @@ Other `.env` settings: `MIGRATE_ATTACHMENTS` (default **on**), `EMAIL_FORMAT`
 - **Time filter:** `--after`/`--before` are applied server-side with
   `receivedDateTime ge/lt ...`, so the limit and paging work on the filtered set.
   Date-only values are UTC midnight; `--before` is exclusive. This is useful for
-  backups such as "everything older than 2023-01-01".
+  backups such as "everything older than 2023-01-01". Folder message counts in the
+  plan are collection totals: the date filter is applied when messages are fetched,
+  so the final count can be smaller.
 - **Restartable:** with `--restartable`, every successfully appended message ID is
   written to `sessions/<source>__<target>__<server>__<hash>.jsonl` (one JSON object
   per line, header validates source/target/parent folder, mode `0600`). A rerun

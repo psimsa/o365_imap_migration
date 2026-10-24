@@ -454,9 +454,12 @@ def plan_rows(plan):
     else:
         parent = "(none - classic folder mapping)"
 
+    source_detail = f"{plan.total_messages} message(s), {len(plan.folders)} folder(s)"
+    if plan.migrate_after or plan.migrate_before:
+        source_detail += "; date filter applied when fetching"
+
     return [
-        ("Source", f"{plan.source_email}  ({plan.total_messages} message(s), "
-                   f"{len(plan.folders)} folder(s))"),
+        ("Source", f"{plan.source_email}  ({source_detail})"),
         ("Target", f"{plan.target_email} @ {plan.target_server}"),
         ("Folders", folders),
         ("Limit", f"newest {plan.limit} message(s)" if plan.limit else "all messages"),
