@@ -4,77 +4,140 @@ Migrate users and shared mailboxes from Microsoft 365 to another mail server ove
 IMAP. It authenticates with an Entra app (client credentials), reads mail through
 Microsoft Graph, and appends each message to the target IMAP account.
 
-## Steps
+## Requirements
 
-1. Install the requirements.
+- Python 3.10+
+- `python -m pip install -r requirements.txt`
+- An Entra app registration with **application** permissions (not delegated) and
+  admin consent:
 
-   ```bash
-   python -m pip install -r requirements.txt
-   ```
+  | Permission | Needed? | Why |
+  | --- | --- | --- |
+  | `Mail.Read` | **yes** | "Read mail in all mailboxes" - covers every Graph call this script makes (`/users/{upn}/mailFolders`, `/messages`, `/messages/{id}/attachments`). |
+  | `Mail.ReadWrite` | no | Only needed to modify the source mailbox (mark read, move, delete). The script never writes to O365; it copies out via `GET` and writes to the IMAP target. |
+  | `User.Read.All` | no | The CSV already provides the UPN and the mail endpoints accept `/users/{userPrincipalName}/...`. The script never calls `/users` or reads profiles. |
 
-2. Register an app in the Microsoft Entra admin center and grant **application**
-   permissions (not delegated) with admin consent:
+  Add `Mail.ReadWrite` only if you later extend the script to clean up the source
+  mailbox after copying. To limit the app to specific mailboxes instead of the
+  whole tenant, configure an
+  [application access policy](https://learn.microsoft.com/en-us/graph/auth-limit-mailbox-access).
 
-   - `Mail.Read`
-   - `Mail.ReadWrite`
-   - `User.Read.All`
+- A client secret under **Certificates & secrets → Client secrets**.
 
-   Then create a client secret under **Certificates & secrets → Client secrets**.
+References: [List messages permissions](https://learn.microsoft.com/graph/api/user-list-messages?view=graph-rest-1.0#permissions),
+[List mailFolders](https://learn.microsoft.com/graph/api/user-list-mailfolders?view=graph-rest-1.0),
+[Mail.Read](https://learn.microsoft.com/graph/permissions-reference#mailread).
 
-3. Copy the config templates and fill them in. Both real files are gitignored.
+## Setup
 
-   ```bash
-   cp .env.example .env
-   cp details.csv.example details.csv
-   ```
+```bash
+cp .env.example .env                  # app credentials and options
+cp details.csv.example details.csv    # one row per mailbox
+chmod 600 .env details.csv
+```
 
-   `.env` holds the app credentials, attachment/body-format options, TLS
-   verification and paging settings. `details.csv` holds one row per mailbox:
+Both real files are gitignored. `details.csv` columns:
 
-   ```csv
-   source_email,target_server,target_email,target_password
-   user@contoso.com,imap.example.com,user@example.com,secret
-   ```
+```csv
+source_email,target_server,target_email,target_password
+user@contoso.com,imap.example.com,user@example.com,secret
+```
 
-4. Verify everything before copying anything:
+## Verify before migrating
 
-   ```bash
-   python o365_imap_migration.py --dry-run
-   ```
+```bash
+python o365_imap_migration.py --dry-run
+```
 
-   The dry run authenticates against Graph, lists the source folders, reads and
-   converts one message, logs in to each target IMAP server, and reports which
-   folders will map where. Nothing is written.
+The dry run authenticates against Graph, lists the selected source folders, reads
+and converts one real message, logs in to each target IMAP server (TLS verified)
+and reports the folder mapping / which folders would be created. Nothing is
+written. Exit code is `0` when every mailbox is ready, `1` otherwise.
 
-5. Run the migration.
+## Run
 
-   ```bash
-   python o365_imap_migration.py
-   ```
+```bash
+python o365_imap_migration.py
+```
+
+Examples:
+
+```bash
+# Mirror the whole O365 folder tree under "Migration 2026" on the target.
+python o365_imap_migration.py --target-parent-folder "Migration 2026"
+
+# Only Inbox, Sent Items and the Archive/2024 subtree, at most 500 messages each.
+python o365_imap_migration.py --folders "Inbox,Sent Items,Archive/2024" --limit 500
+
+# Trial run of 25 newest Inbox messages into a scratch folder.
+python o365_imap_migration.py --target-parent-folder Scratch --folders Inbox --limit 25
+```
 
 ## Options
 
-| Option | Description |
-| --- | --- |
-| `--dry-run` | Verify credentials and access only; writes nothing |
-| `--csv PATH` | Mailbox CSV file (default: `details.csv`, or `CSV_FILE` in `.env`) |
-| `--env-file PATH` | Environment file (default: `.env`) |
+| CLI | `.env` | Default | Meaning |
+| --- | --- | --- | --- |
+| `--dry-run` | - | off | Verify credentials/access and report; writes nothing |
+| `--csv PATH` | `CSV_FILE` | `details.csv` | Mailbox list |
+| `--env-file PATH` | - | `.env` | Environment file |
+| `--target-parent-folder PATH` | `TARGET_PARENT_FOLDER` | empty | Migrate the source folder tree below this target folder, creating missing folders (parents first). Empty = classic mapping |
+| `--folders LIST` | `MIGRATE_FOLDERS` | all | Comma-separated source folders or paths; a folder also selects its subtree |
+| `--limit N` | `MIGRATE_LIMIT` | `0` (all) | At most N messages per mailbox, newest first |
 
-## Notes
+Other `.env` settings: `MIGRATE_ATTACHMENTS`, `EMAIL_FORMAT` (`html`/`plain`),
+`IMAP_SSL_VERIFY`, `GRAPH_PAGE_SIZE`, plus the three `SOURCE_*` credentials.
 
-- **Paging:** Graph returns 10 items per page by default. The script sets
-  `$top` (`GRAPH_PAGE_SIZE`) and follows `@odata.nextLink` until every folder and
-  message has been read.
+## Behaviour
+
+- **Progress:** one line per mailbox with `done/total`, percent, `ok/failed`
+  counts, messages/second, ETA and the current folder. On a terminal the block is
+  redrawn in place; when output is redirected (CI/logs) a line is emitted every
+  ~2 seconds and on completion. Fetching also reports per-folder/page progress.
+  Warnings are printed without breaking the progress display.
+- **Folder tree:** with `TARGET_PARENT_FOLDER` every source path is recreated
+  below it (`Migration/Sent Items`, `Migration/Archive/2024`, ...), sanitizing
+  invalid characters, using the target server's hierarchy delimiter and IMAP
+  modified UTF-7 for non-ASCII names. Without it, `Inbox`, `Drafts`, `Sent Items`,
+  `Deleted Items` and `Junk Email` map to their usual IMAP names; unknown folders
+  fall back to `INBOX` and the dry run reports them.
+- **Paging:** Graph returns 10 items per page by default. The script sets `$top`
+  (`GRAPH_PAGE_SIZE`) and follows `@odata.nextLink` until every folder and
+  message has been read; 429/5xx responses are retried honouring `Retry-After`.
 - **Body format:** Graph only returns HTML bodies. `EMAIL_FORMAT=html` stores the
   HTML as-is; `EMAIL_FORMAT=plain` strips the markup. Some target servers do not
   render HTML well.
-- **Folders:** top-level and nested folders are read. `Inbox`, `Drafts`,
-  `Sent Items`, `Deleted Items` and `Junk Email` map to their usual IMAP names;
-  any other folder falls back to `INBOX`, and the dry run reports the fallbacks.
 - **TLS:** the target server's certificate is verified by default. Setting
-  `IMAP_SSL_VERIFY=false` disables verification and should only be used for
+  `IMAP_SSL_VERIFY=false` disables verification (MITM risk) and is only meant for
   internal servers with self-signed certificates.
 - **Tokens:** Graph tokens are cached under `tokens/token_<email>/` (gitignored).
-  Migration re-authenticates on every run; the dry run reuses a cached token.
-- **Secrets:** `.env` and `details.csv` contain credentials. Keep them out of git
-  and restrict file permissions (`chmod 600 .env details.csv`).
+  A normal migration re-authenticates on every run; the dry run reuses a cached,
+  unexpired token.
+
+## Known limitations
+
+- `Bcc` recipients are folded into the `To` header.
+- `INTERNALDATE` is the migration time, not the original `receivedDateTime`.
+- Message bodies are re-rendered from the Graph JSON body; original headers other
+  than `From`/`To`/`Subject`/`Date` (e.g. `Message-ID`, `Reply-To`) are not kept.
+- A filter on a parent folder selects it and all of its subfolders.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the full history. Unreleased highlights:
+
+- `Mail.Read` is the only Graph permission required (README previously asked for
+  `Mail.ReadWrite` and `User.Read.All` as well).
+- New `--target-parent-folder`, `--folders` and `--limit` switches (with `.env`
+  equivalents `TARGET_PARENT_FOLDER`, `MIGRATE_FOLDERS`, `MIGRATE_LIMIT`).
+- Live per-mailbox progress (percentage, ok/failed, rate, ETA, current folder).
+- Paging fix: all messages and nested folders are now migrated, not just the first
+  page of top-level folders.
+- TLS certificate verification for the target IMAP server.
+- `--dry-run` for a full credential/access check without writing anything.
+
+## Project
+
+This is a fork of
+[ArunasVysn/o365_imap_migration](https://github.com/ArunasVysn/o365_imap_migration),
+maintained at [psimsa/o365_imap_migration](https://github.com/psimsa/o365_imap_migration).
+Task tracking for the current work lives in [TASKS.md](TASKS.md).

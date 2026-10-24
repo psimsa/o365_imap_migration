@@ -1,6 +1,7 @@
 # Task tracking
 
 Branch: `feature/migration-controls`
+Remote: `origin` -> `git@github.com:psimsa/o365_imap_migration.git` (fork)
 
 ## Done
 
@@ -12,17 +13,27 @@ Branch: `feature/migration-controls`
 - [x] Add `--dry-run` credential/access verification with a report.
 - [x] Update dependencies (O365 2.1.10, requests 2.34.2, python-dotenv 1.2.4), adapt to the
       2.1.x token cache and `requested_scopes` API.
+- [x] `TARGET_PARENT_FOLDER` / `--target-parent-folder`: mirror the O365 folder tree below a
+      target parent folder, creating missing folders (parents first) with the server's
+      hierarchy delimiter and IMAP modified UTF-7 names.
+- [x] `MIGRATE_FOLDERS` / `--folders`: comma-separated source folders, subtree match.
+- [x] `MIGRATE_LIMIT` / `--limit`: cap messages per mailbox (newest first).
+- [x] Live progress while migrating: per-mailbox done/total, %, ok/failed, msg/s, ETA and
+      current folder; in-place block on a TTY, throttled lines otherwise, and a single
+      renderer so thread warnings cannot corrupt it.
+- [x] Review documented Graph permissions; README now asks for `Mail.Read` only.
+- [x] Point `origin` at the fork `git@github.com:psimsa/o365_imap_migration.git`.
+- [x] Add `CHANGELOG.md` and link it from the README.
 
-## In progress
+## Verification
 
-- [ ] `TARGET_PARENT_FOLDER` / `--target-parent-folder`: migrate the O365 folder tree below a
-      target parent folder, creating missing folders on the IMAP server (hierarchy delimiter,
-      modified UTF-7, recursive `CREATE`).
-- [ ] `MIGRATE_FOLDERS` / `--folders`: comma-separated source folders (subtree match).
-- [ ] `MIGRATE_LIMIT` / `--limit`: cap the number of messages per mailbox.
-- [ ] Live progress while migrating (per mailbox: done/total, %, ok/failed, rate, ETA,
-      current folder); TTY in-place board and log-friendly lines otherwise.
-- [ ] Review the documented Graph permissions and fix the README if `Mail.Read` is enough.
+- `python -m py_compile o365_imap_migration.py`
+- Stub harness (24 checks): Graph paging/limits, folder filters and subtree matching,
+  parent-folder creation + UTF-7 wire names, TLS `CERT_REQUIRED`/opt-out, default-mapping
+  INBOX fallback, append failure counting, progress board (TTY and non-TTY), `safe_print`
+  routing, dry run (default/parent/failure), `.env` parsing/validation, CSV dedupe, CLI.
+- A real Graph/IMAP run is still required in an environment with the dependencies installed
+  (no `pip` available while this was developed). Start with `--dry-run`.
 
 ## Investigation: Graph permissions
 
@@ -34,11 +45,12 @@ Branch: `feature/migration-controls`
   which the script does not do.
 - `User.Read.All` is not needed: the CSV supplies the UPN and the mail endpoints accept
   `/users/{userPrincipalName}/...` directly.
-- Conclusion: README should request `Mail.Read` only.
+- Conclusion: README requests `Mail.Read` only.
 
-## Open questions
+## Next / open questions
 
-- Should unmapped folders in default mode be created instead of falling back to `INBOX`?
-  (Now solved by `TARGET_PARENT_FOLDER`, which mirrors the tree and creates folders.)
-- `Bcc` recipients are currently folded into the `To` header (inherited behaviour).
-- `INTERNALDATE` is set to migration time rather than `receivedDateTime`.
+- [ ] Run a real end-to-end trial (`--dry-run`, then `--limit 25`) and tag `1.1.0`.
+- [ ] `Bcc` recipients are folded into the `To` header.
+- [ ] `INTERNALDATE` is migration time rather than `receivedDateTime`.
+- [ ] Original `Message-ID`/`Reply-To` headers are lost during re-rendering.
+- [ ] Optionally add `--no-progress` for very quiet logs.
