@@ -62,6 +62,8 @@ Remote: `origin` -> `git@github.com:psimsa/o365_imap_migration.git` (fork)
 - [x] `--reset-session` / `RESET_SESSION` to delete the session and start over.
 - [x] `--after` / `--before` (`MIGRATE_AFTER` / `MIGRATE_BEFORE`) with server-side
       `receivedDateTime` filtering, UTC normalization and range validation.
+- [x] Confirmation page prints the exact non-interactive restart command before the
+      migration starts (includes `--restartable`, filters and a custom `--env-file`).
 - [x] Interactive wizard: date-filter prompts and a resume prompt (uses or deletes an
       existing session, defaults on when one exists), plus resume/time-filter rows in the plan.
 - [x] Tests for date parsing/filtering, skip-before-limit paging, session round-trip,
@@ -69,6 +71,18 @@ Remote: `origin` -> `git@github.com:psimsa/o365_imap_migration.git` (fork)
 - [x] Real-tenant check of the date filter: `before 2020-01-01`, `after 2025-01-01` and a
       2020-2021 range all returned matching messages from `pavel@simsa.cz`.
 - [ ] Real-tenant trial of resume + a full filtered migration (needs IMAP credentials).
+
+## Streaming + UX fixes (new)
+
+- [x] Migration now streams page-by-page (fetch -> convert -> append) instead of
+      downloading the whole mailbox first; the target receives mail during the run and
+      memory stays flat. The restart session file is created when migration starts.
+- [x] Parent-folder input strips one pair of surrounding quotes (`'Office Migration'`).
+- [x] Progress board supports an unknown total (date filters / resumed runs).
+- [x] Confirmation page prints the restart command before starting; a manually entered
+      mailbox row is persisted before migration so the command works after an interrupt.
+- [x] Real-tenant streaming check: two filtered Inbox messages (2020 range) streamed with
+      attachments over `pavel@simsa.cz`.
 
 ## Next / open questions
 

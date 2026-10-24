@@ -51,6 +51,10 @@ class PureHelperTests(unittest.TestCase):
     def test_parent_name_validation(self):
         self.assertEqual(tui.validate_parent_name(" Migration 2026 ", "/"),
                          "Migration 2026")
+        self.assertEqual(tui.validate_parent_name("'Office Migration'", "/"),
+                         "Office Migration")
+        self.assertEqual(tui.validate_parent_name('"Office Migration"', "/"),
+                         "Office Migration")
         with self.assertRaises(ValueError):
             tui.validate_parent_name("", "/")
         with self.assertRaises(ValueError):
@@ -133,9 +137,25 @@ class PureHelperTests(unittest.TestCase):
         plan = tui.build_plan(cfg, tui.MailboxChoice("u@example.com"),
                               support.sample_folders(), "/", ["INBOX"],
                               resume_count=4)
+        plan.command = tui.build_rerun_command(cfg)
         rows = dict(tui.plan_rows(plan))
         self.assertIn("after 2020-01-01", rows["Time filter"])
         self.assertIn("4 message(s)", rows["Restartable"])
+        self.assertIn("--restartable", rows["Restart command"])
+        self.assertIn("--after", rows["Restart command"])
+
+    def test_rerun_command_includes_filters_and_omits_reset(self):
+        cfg = support.make_cfg(
+            restartable=True, reset_session=True, migrate_limit=25,
+            migrate_after="2020-01-01T00:00:00Z", migrate_before="2021-01-01T00:00:00Z",
+            migrate_folders=["Inbox"], target_parent_folder="Office Migration",
+            csv_file="mail.csv")
+        command = tui.build_rerun_command(cfg, "/tmp/custom.env")
+        for token in ["--env-file /tmp/custom.env", "--csv mail.csv",
+                      "--folders Inbox", "--limit 25", "--after", "--before",
+                      "--target-parent-folder 'Office Migration'", "--restartable"]:
+            self.assertIn(token, command)
+        self.assertNotIn("--reset-session", command)
 
     def test_scripted_confirm_defaults(self):
         self.assertFalse(tui.ScriptedPrompter([None]).confirm("q", default=False))
@@ -212,8 +232,13 @@ class FlowTests(unittest.TestCase):
         mailbox = migrate_mock.call_args.args[1]
         self.assertEqual(mailbox, ("user@contoso.com", "imap.example.com",
                                    "target@example.com", "pw"))
-        self.assertTrue(any("Rerun non-interactively" in line
+        self.assertTrue(any("Restart command" in line
                             for line in self.renderer.lines))
+        restart_index = next(index for index, line in enumerate(self.renderer.lines)
+                             if "Restart command" in line)
+        execute_index = next(index for index, line in enumerate(self.renderer.lines)
+                             if "Step 8/8" in line)
+        self.assertLess(restart_index, execute_index)
         self.assertTrue(any("Time filter" in line for line in self.renderer.lines))
         self.assertTrue(any("Restartable" in line for line in self.renderer.lines))
         cfg_used = mig.migrate_mailbox.call_args.args[0]
@@ -243,6 +268,8 @@ class FlowTests(unittest.TestCase):
         self.assertTrue(cfg_used.restartable)
         self.assertFalse(cfg_used.reset_session)
         self.assertTrue(any("Progress will be recorded" in line
+                            for line in self.renderer.lines))
+        self.assertTrue(any("Restart command" in line and "--restartable" in line
                             for line in self.renderer.lines))
 
     def test_resume_prompt_offers_existing_session(self):

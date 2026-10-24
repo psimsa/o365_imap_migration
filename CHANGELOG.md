@@ -23,10 +23,12 @@ Planned release: `1.1.0`. Everything below is on `feature/interactive-tui`
 - **Draft interactive wizard** (`-i` / `--interactive`): single-mailbox flow that picks a
   mailbox from `details.csv` or asks for one, verifies Graph credentials from `.env`
   (hidden input, optional atomic write-back), shows account statistics, asks for folder
-  scope, a message limit and a received-date range, validates the IMAP login, offers a root-only target parent
-  folder (numbered menu under 10 folders, fuzzy typeahead otherwise, new names are
-  created), then shows a read-only validation screen and the final plan. Confirmation
-  defaults to **No** and no message is written before an explicit `yes`.
+  scope, a message limit and a received-date range, offers restartable/resume support
+  (with an existing-session prompt), validates the IMAP login, offers a root-only
+  target parent folder (numbered menu under 10 folders, fuzzy typeahead otherwise, new
+  names are created), then shows a read-only validation screen and the final plan,
+  including the exact non-interactive **restart command**, before the confirmation.
+  Confirmation defaults to **No** and no message is written before an explicit `yes`.
 - Optional TUI dependencies in `requirements-tui.txt` (`rich`, `prompt_toolkit`); batch
   mode does not import them.
 - Unit-test suite (27 tests, hermetic fake Graph/IMAP backends) and a GitHub Actions
@@ -51,6 +53,13 @@ Planned release: `1.1.0`. Everything below is on `feature/interactive-tui`
 
 ### Changed
 
+- Migration is **streamed**: each Graph page is fetched, converted and appended
+  immediately instead of buffering every selected message (with attachments) in
+  memory before the first IMAP write. The target starts receiving mail while the
+  source is still being read, and the restart session file is created as soon as
+  the migration starts.
+- Parent-folder input strips one pair of surrounding quotes, so typing
+  `'Office Migration'` creates `Office Migration`, not a mailbox containing quotes.
 - Attachments are now enabled by default (`MIGRATE_ATTACHMENTS=true`); `EMAIL_FORMAT`
   keeps its `html` default.
 - `load_config()` accepts `require_credentials=False` so the wizard can prompt for missing

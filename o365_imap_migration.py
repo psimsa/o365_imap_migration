@@ -116,7 +116,7 @@ class ProgressBoard:
                 key = f"{label} #{suffix}"
                 suffix += 1
             self.rows[key] = {
-                "total": max(int(total), 0),
+                "total": None if total is None else max(int(total), 0),
                 "done": 0,
                 "migrated": 0,
                 "failed": 0,
@@ -153,6 +153,8 @@ class ProgressBoard:
             if row is None:
                 return
             row["status"] = status
+            if row["total"] is None:
+                row["total"] = row["done"]
             if not self.tty:
                 self._render(key, force=True)
                 return
@@ -185,23 +187,28 @@ class ProgressBoard:
         row = self.rows[key]
         total = row["total"]
         done = row["done"]
-        percent = (100.0 * done / total) if total else 100.0
         elapsed = max(time.monotonic() - row["started"], 1e-9)
         rate = done / elapsed
 
-        if done and done < total:
-            seconds = int((total - done) / rate) if rate else 0
-            eta = f"ETA {seconds // 60}d{seconds % 60:02d}s"
-        elif done >= total:
-            eta = "ETA done"
-        else:
+        if total is None:
+            counter = f"{done} done"
             eta = "ETA --"
+        else:
+            percent = (100.0 * done / total) if total else 100.0
+            counter = f"{done}/{total} {percent:5.1f}%"
+            if done and done < total:
+                seconds = int((total - done) / rate) if rate else 0
+                eta = f"ETA {seconds // 60}d{seconds % 60:02d}s"
+            elif done >= total:
+                eta = "ETA done"
+            else:
+                eta = "ETA --"
 
         folder = row["folder"] or "-"
         if len(folder) > 32:
             folder = "..." + folder[-29:]
 
-        return (f"[{key}] {done}/{total} {percent:5.1f}% | {row['migrated']} ok, "
+        return (f"[{key}] {counter} | {row['migrated']} ok, "
                 f"{row['failed']} failed | {rate:5.1f} msg/s | {eta} | {folder} | "
                 f"{row['status']}")
 
@@ -212,7 +219,7 @@ class ProgressBoard:
 
         row = self.rows[key]
         now = time.monotonic()
-        if not force and row["done"] < row["total"] and (now - row["last_emit"]) < self.interval:
+        if not force and (now - row["last_emit"]) < self.interval:
             return
         row["last_emit"] = now
         self.stream.write(self._format(key) + "\n")
@@ -282,9 +289,19 @@ def parse_folder_list(value):
     return [item.strip() for item in (value or "").split(",") if item.strip()]
 
 
+def strip_outer_quotes(value):
+    """Removes one matching pair of surrounding single/double quotes."""
+    text = (value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return text[1:-1].strip()
+    return text
+
+
 def normalize_parent_folder(value):
     """Normalizes a target parent folder to 'A/B' form (no leading/trailing slash)."""
-    return "/".join(part.strip() for part in (value or "").split("/") if part.strip())
+    value = strip_outer_quotes(value)
+    return "/".join(strip_outer_quotes(part.strip())
+                    for part in value.split("/") if part.strip())
 
 
 def normalize_date_bound(value):
@@ -493,6 +510,11 @@ class MigrationSession:
         self.written = 0
         return self
 
+    def ensure_file(self):
+        """Creates the session file with its header if it does not exist yet."""
+        self._ensure_open()
+        self._close()
+
     def contains(self, message_id):
         return str(message_id) in self.ids
 
@@ -603,9 +625,9 @@ def graph_get(url, access_token, params=None, timeout=60, max_attempts=5):
     raise GraphError(f"GET {url} failed after {max_attempts} attempts: {last_error}")
 
 
-def graph_get_all(url, access_token, params=None, timeout=60, limit=None,
-                  on_page=None, skip_ids=None):
-    """GET every page of a Graph collection by following @odata.nextLink.
+def graph_iter(url, access_token, params=None, timeout=60, limit=None,
+               on_page=None, skip_ids=None):
+    """Yield a Graph collection page by page, following @odata.nextLink.
 
     Graph returns at most 10 items per page by default, so ignoring
     @odata.nextLink silently drops everything after the first page.
@@ -613,28 +635,29 @@ def graph_get_all(url, access_token, params=None, timeout=60, limit=None,
     ``skip_ids`` removes already-migrated message IDs *before* the limit is
     applied, so a resumed run with ``--limit N`` fetches N *new* messages.
     """
-    items = []
-    done = False
+    count = 0
     next_url, next_params = url, params
-    while next_url and not done:
+    while next_url:
         page = graph_get(next_url, access_token, params=next_params, timeout=timeout)
         for item in page.get("value", []):
             if skip_ids and str(item.get("id")) in skip_ids:
                 continue
-            items.append(item)
-            if limit is not None and len(items) >= limit:
-                done = True
-                break
+            yield item
+            count += 1
+            if limit is not None and count >= limit:
+                return
         if on_page is not None:
-            on_page(len(items))
-        if done:
-            break
+            on_page(count)
         next_url = page.get("@odata.nextLink")
         # The nextLink already carries the query string of the original request.
         next_params = None
-    if limit is not None:
-        items = items[:limit]
-    return items
+
+
+def graph_get_all(url, access_token, params=None, timeout=60, limit=None,
+                  on_page=None, skip_ids=None):
+    """Materializes :func:`graph_iter` into a list."""
+    return list(graph_iter(url, access_token, params=params, timeout=timeout,
+                           limit=limit, on_page=on_page, skip_ids=skip_ids))
 
 
 def get_mail_folders(cfg, access_token, user_email):
@@ -697,32 +720,35 @@ def fetch_attachments(access_token, email_address, message_id):
     return graph_get_all(url, access_token)
 
 
-def fetch_all_emails(cfg, source_email, access_token, skip_ids=None):
-    """Fetch the selected emails from the source email account.
+def iter_source_emails(cfg, source_email, access_token, skip_ids=None, folders=None):
+    """Yield selected messages lazily, one at a time, with attachments.
 
-    ``skip_ids`` holds message IDs already recorded in a restartable session.
+    Nothing is buffered for the whole mailbox: a page is fetched, each message is
+    converted and appended, and only then is the next page requested. That keeps
+    memory flat and lets the target receive messages while the source is still
+    being read.
     """
-    folders = get_mail_folders(cfg, access_token, source_email)
+    if folders is None:
+        folders = get_mail_folders(cfg, access_token, source_email)
     selected, missing = select_folders(folders, cfg.migrate_folders)
     for name in missing:
         safe_print(f"[{source_email}] warning: source folder not found: {name!r}")
     if not selected:
         safe_print(f"[{source_email}] no source folders matched {cfg.migrate_folders!r}.")
-        return []
+        return
 
     remaining = cfg.migrate_limit or None
-    all_emails = []
+    filter_expression = build_received_filter(cfg)
 
     for folder in selected:
         if remaining is not None and remaining <= 0:
             break
 
-        top = cfg.graph_page_size if remaining is None else min(cfg.graph_page_size, remaining)
-        params = {"$top": top}
-        filter_expression = build_received_filter(cfg)
+        params = {"$top": cfg.graph_page_size}
         if filter_expression:
             params["$filter"] = filter_expression
         last_report = [0.0]
+        fetched = 0
 
         def on_page(count, path=folder["path"]):
             now = time.monotonic()
@@ -731,38 +757,37 @@ def fetch_all_emails(cfg, source_email, access_token, skip_ids=None):
                 safe_print(f"[{source_email}] {path}: {count} message(s) fetched")
 
         try:
-            messages = graph_get_all(
-                f"{_user_url(source_email)}/mailFolders/{folder['id']}/messages",
-                access_token,
-                params=params,
-                limit=remaining,
-                on_page=on_page,
-                skip_ids=skip_ids,
-            )
+            for message in graph_iter(
+                    f"{_user_url(source_email)}/mailFolders/{folder['id']}/messages",
+                    access_token, params=params, limit=remaining,
+                    on_page=on_page, skip_ids=skip_ids):
+                message["folderName"] = folder["displayName"]
+                message["folderPath"] = folder["path"]
+                if cfg.migrate_attachments:
+                    try:
+                        message["attachments"] = fetch_attachments(
+                            access_token, source_email, message["id"])
+                    except GraphError as e:
+                        safe_print(f"[{source_email}] failed to fetch attachments for "
+                                   f"message {message.get('id')}: {e}")
+                        message["attachments"] = []
+                fetched += 1
+                yield message
+                if remaining is not None:
+                    remaining -= 1
+                    if remaining <= 0:
+                        break
         except GraphError as e:
             safe_print(f"[{source_email}] failed to fetch emails from folder "
                        f"'{folder['path']}': {e}")
-            continue
 
-        for message in messages:
-            message["folderName"] = folder["displayName"]
-            message["folderPath"] = folder["path"]
-            if cfg.migrate_attachments:
-                try:
-                    message["attachments"] = fetch_attachments(
-                        access_token, source_email, message["id"])
-                except GraphError as e:
-                    safe_print(f"[{source_email}] failed to fetch attachments for message "
-                               f"{message.get('id')}: {e}")
-                    message["attachments"] = []
+        safe_print(f"[{source_email}] {folder['path']}: {fetched} message(s) fetched")
 
-        all_emails.extend(messages)
-        safe_print(f"[{source_email}] {folder['path']}: {len(messages)} message(s) fetched")
 
-        if remaining is not None:
-            remaining -= len(messages)
-
-    return all_emails
+def fetch_all_emails(cfg, source_email, access_token, skip_ids=None):
+    """Materializes the selected emails (kept for callers and tests)."""
+    return list(iter_source_emails(cfg, source_email, access_token,
+                                   skip_ids=skip_ids))
 
 
 # Message conversion ---------------------------------------------------------
@@ -1114,45 +1139,60 @@ def _append_with_retries(mail, wire_folder, payload, attempts=3):
     return False
 
 
+def prepare_target_state(target_mail):
+    """Reads the target hierarchy once and returns (state, warned folders)."""
+    delimiter, existing = get_imap_hierarchy(target_mail)
+    state = {
+        "delimiter": delimiter,
+        "existing": {name.lower() for name in existing},
+    }
+    return state, set()
+
+
+def migrate_one(cfg, target_mail, msg, state, warned):
+    """Converts and appends a single message. Returns (ok, display_folder)."""
+    if not isinstance(msg, dict):
+        safe_print(f"Unexpected message format: {msg!r}")
+        return False, ""
+
+    display_folder = ""
+    try:
+        source_path = msg.get("folderPath") or msg.get("folderName") or "Inbox"
+
+        if cfg.target_parent_folder:
+            target_path = build_target_path(cfg, source_path, state["delimiter"])
+            wire_folder = ensure_target_folder(target_mail, target_path,
+                                               state["delimiter"], state)
+            display_folder = target_path
+        else:
+            display_folder = msg.get("folderName") or "Inbox"
+            wire_folder = default_target_folder(display_folder, state, warned)
+
+        email_message = convert_to_rfc822(cfg, msg)
+        if not isinstance(email_message, str):
+            safe_print(f"Email conversion failed for message: {msg.get('id')}")
+            return False, display_folder
+
+        return _append_with_retries(
+            target_mail, wire_folder, email_message.encode("utf-8")), display_folder
+    except Exception as e:
+        safe_print(f"Error migrating email: {e}")
+        return False, display_folder
+
+
 def migrate_emails(cfg, target_mail, messages, board=None, key=None, session=None):
     """Migrates a list of Graph message dictionaries to the target account."""
-    delimiter, existing = get_imap_hierarchy(target_mail)
-    state = {"existing": {name.lower() for name in existing}}
-    warned = set()
+    state, warned = prepare_target_state(target_mail)
     migrated = failed = 0
     current_folder = None
 
     for msg in messages:
-        ok = False
-        display_folder = ""
-        try:
-            if not isinstance(msg, dict):
-                safe_print(f"Unexpected message format: {msg!r}")
-            else:
-                source_path = msg.get("folderPath") or msg.get("folderName") or "Inbox"
+        ok, display_folder = migrate_one(cfg, target_mail, msg, state, warned)
 
-                if cfg.target_parent_folder:
-                    target_path = build_target_path(cfg, source_path, delimiter)
-                    wire_folder = ensure_target_folder(
-                        target_mail, target_path, delimiter, state)
-                    display_folder = target_path
-                else:
-                    display_folder = msg.get("folderName") or "Inbox"
-                    wire_folder = default_target_folder(display_folder, state, warned)
-
-                if board is not None and key is not None and display_folder != current_folder:
-                    current_folder = display_folder
-                    board.set_folder(key, display_folder)
-
-                email_message = convert_to_rfc822(cfg, msg)
-                if not isinstance(email_message, str):
-                    safe_print(f"Email conversion failed for message: {msg.get('id')}")
-                else:
-                    ok = _append_with_retries(
-                        target_mail, wire_folder, email_message.encode("utf-8"))
-
-        except Exception as e:
-            safe_print(f"Error migrating email: {e}")
+        if (board is not None and key is not None and display_folder
+                and display_folder != current_folder):
+            current_folder = display_folder
+            board.set_folder(key, display_folder)
 
         if ok:
             migrated += 1
@@ -1167,7 +1207,12 @@ def migrate_emails(cfg, target_mail, messages, board=None, key=None, session=Non
 
 
 def migrate_mailbox(cfg, mailbox, board=None):
-    """Migrates a single mailbox and returns (migrated, failed)."""
+    """Migrates a single mailbox and returns (migrated, failed).
+
+    Messages are streamed: each page is fetched, then converted and appended
+    immediately, so the target starts receiving mail while the source is still
+    being read and memory stays flat.
+    """
     source_email, target_server, target_email, target_password = mailbox
     safe_print(f"[{source_email}] starting migration to {target_email} ({target_server})")
 
@@ -1175,44 +1220,69 @@ def migrate_mailbox(cfg, mailbox, board=None):
     session = None
     try:
         access_token, _ = authenticate_account(cfg, source_email)
+
         if cfg.restartable:
             if cfg.reset_session:
                 MigrationSession(session_path(cfg, mailbox), source_email, target_email,
                                  target_server, cfg.target_parent_folder).reset()
             session = MigrationSession.load(cfg, mailbox)
+            session.ensure_file()
             safe_print(f"[{source_email}] restartable session {session.path} "
                        f"({len(session.ids)} message(s) already recorded)")
 
-        messages = fetch_all_emails(cfg, source_email, access_token,
-                                    skip_ids=session.ids if session is not None else None)
-        if not messages:
-            if session is not None:
-                safe_print(f"[{source_email}] nothing new to migrate "
-                           f"({len(session.ids)} message(s) in the session).")
-            else:
-                safe_print(f"[{source_email}] no messages to migrate.")
-            return 0, 0
+        folders = get_mail_folders(cfg, access_token, source_email)
+        selected, _ = select_folders(folders, cfg.migrate_folders)
 
-        safe_print(f"[{source_email}] fetched {len(messages)} message(s); "
-                   f"connecting to {target_server}")
-        target_mail = connect_to_target_imap(cfg, target_server, target_email, target_password)
+        total = sum(folder.get("totalItemCount") or 0 for folder in selected)
+        if build_received_filter(cfg) or (session is not None and session.ids):
+            total = None  # filtered/skipped count is only known while streaming
+        elif cfg.migrate_limit:
+            total = min(total, cfg.migrate_limit)
+
+        target_mail = connect_to_target_imap(cfg, target_server, target_email,
+                                             target_password)
         if target_mail is None:
             safe_print(f"[{source_email}] failed to connect to target IMAP server {target_server}")
             return 0, 0
 
+        state, warned = prepare_target_state(target_mail)
         if board is not None:
-            key = board.register(source_email, len(messages))
+            key = board.register(source_email, total)
 
+        migrated = failed = 0
+        current_folder = None
         try:
-            migrated, failed = migrate_emails(cfg, target_mail, messages, board, key,
-                                              session=session)
+            for message in iter_source_emails(
+                    cfg, source_email, access_token,
+                    skip_ids=session.ids if session is not None else None,
+                    folders=folders):
+                ok, display_folder = migrate_one(cfg, target_mail, message, state, warned)
+
+                if (board is not None and key is not None and display_folder
+                        and display_folder != current_folder):
+                    current_folder = display_folder
+                    board.set_folder(key, display_folder)
+
+                if ok:
+                    migrated += 1
+                    if session is not None:
+                        session.record(message.get("id"), display_folder)
+                else:
+                    failed += 1
+                if board is not None and key is not None:
+                    board.advance(key, ok)
         finally:
             try:
                 target_mail.logout()
             except Exception:
                 pass
+
+        if migrated == 0 and failed == 0:
             if session is not None:
-                session.close()
+                safe_print(f"[{source_email}] nothing new to migrate "
+                           f"({len(session.ids)} message(s) in the session).")
+            else:
+                safe_print(f"[{source_email}] no messages to migrate.")
 
         if board is not None and key is not None:
             board.finish(key, "done" if failed == 0 else "done with errors")
@@ -1224,10 +1294,11 @@ def migrate_mailbox(cfg, mailbox, board=None):
     except Exception as e:
         if board is not None and key is not None:
             board.finish(key, "failed")
-        if session is not None:
-            session.close()
         safe_print(f"[{source_email}] migration failed: {e}")
         return 0, 0
+    finally:
+        if session is not None:
+            session.close()
 
 
 # Dry run --------------------------------------------------------------------

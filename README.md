@@ -95,17 +95,21 @@ The wizard handles **one mailbox** per run:
 3. show account statistics (folders, message counts, sizes);
 4. choose all folders or a subset (a parent also selects its subfolders), an optional
    message limit and an optional received-date range;
-5. ask for the target IMAP credentials and verify the login with TLS;
+5. ask for the target IMAP credentials and verify the login with TLS; for a manually
+   entered mailbox it also asks whether to save the row to `details.csv` (written
+   before migration, so the restart command works);
 6. optionally mirror the folder tree under a root-level target folder: a numbered menu
    when the target has fewer than 10 root folders, otherwise a fuzzy typeahead input;
    a non-matching name is created;
 7. ask whether to record progress for resuming an interrupted run (default on when a
    session exists; an existing session can be kept, or deleted and restarted), then
    show a **validation screen** (Graph auth, mailbox access, one sample message, IMAP
-   login, folder plan, resume state) and the final plan, then ask for confirmation.
+   login, folder plan, resume state) and the final plan — including the exact
+   **restart command** to resume with if the run is interrupted — then ask for
+   confirmation.
    The confirmation defaults to **No** and only an explicit `y`/`yes` starts the
    migration;
-8. migrate, report `migrated`/`failed`, and print the equivalent non-interactive command.
+8. migrate (streaming), report `migrated`/`failed`, and print the restart command again.
 
 The validation screen is the interactive dry run: nothing is fetched in bulk and nothing
 is written until the explicit confirmation. `--dry-run` is therefore not needed with `-i`
@@ -148,6 +152,10 @@ Other `.env` settings: `MIGRATE_ATTACHMENTS` (default **on**), `EMAIL_FORMAT`
   modified UTF-7 for non-ASCII names. Without it, `Inbox`, `Drafts`, `Sent Items`,
   `Deleted Items` and `Junk Email` map to their usual IMAP names; unknown folders
   fall back to `INBOX` and the dry run reports them.
+- **Streaming:** each Graph page is fetched, converted and appended immediately, so
+  the target starts receiving mail while the source is still being read and memory
+  stays flat (important for 50k-message mailboxes with attachments). The restart
+  session file is created when the run starts, not after the first message.
 - **Paging:** Graph returns 10 items per page by default. The script sets `$top`
   (`GRAPH_PAGE_SIZE`) and follows `@odata.nextLink` until every folder and
   message has been read; 429/5xx responses are retried honouring `Retry-After`.
@@ -157,6 +165,8 @@ Other `.env` settings: `MIGRATE_ATTACHMENTS` (default **on**), `EMAIL_FORMAT`
   backups such as "everything older than 2023-01-01". Folder message counts in the
   plan are collection totals: the date filter is applied when messages are fetched,
   so the final count can be smaller.
+- **Parent folder names:** surrounding quotes are stripped, so typing
+  `'Office Migration'` (or `"Office Migration"`) targets `Office Migration`.
 - **Restartable:** with `--restartable`, every successfully appended message ID is
   written to `sessions/<source>__<target>__<server>__<hash>.jsonl` (one JSON object
   per line, header validates source/target/parent folder, mode `0600`). A rerun

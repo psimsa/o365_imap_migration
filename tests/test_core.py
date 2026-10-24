@@ -97,7 +97,10 @@ class CoreTests(unittest.TestCase):
         messages = [support.message(1), support.message(2)]
         with mock.patch.object(mig, "authenticate_account",
                                return_value=("token", None)), \
-                mock.patch.object(mig, "fetch_all_emails", return_value=messages), \
+                mock.patch.object(mig, "get_mail_folders",
+                                  return_value=support.sample_folders()), \
+                mock.patch.object(mig, "iter_source_emails",
+                                  return_value=iter(messages)), \
                 mock.patch.object(mig, "connect_to_target_imap",
                                   return_value=support.FakeIMAP()):
             migrated, failed = mig.migrate_mailbox(
@@ -190,13 +193,16 @@ class CoreTests(unittest.TestCase):
 
             seen = {}
 
-            def fake_fetch(cfg_, source, token, skip_ids=None):
+            def fake_iter(cfg_, source, token, skip_ids=None, folders=None):
                 seen["skip"] = set(skip_ids or ())
-                return [support.message(2)]
+                return iter([support.message(2)])
 
             with mock.patch.object(mig, "authenticate_account",
                                    return_value=("token", None)), \
-                    mock.patch.object(mig, "fetch_all_emails", side_effect=fake_fetch), \
+                    mock.patch.object(mig, "get_mail_folders",
+                                      return_value=support.sample_folders()), \
+                    mock.patch.object(mig, "iter_source_emails",
+                                      side_effect=fake_iter), \
                     mock.patch.object(mig, "connect_to_target_imap",
                                       return_value=support.FakeIMAP()):
                 migrated, failed = mig.migrate_mailbox(cfg, mailbox)
@@ -206,6 +212,71 @@ class CoreTests(unittest.TestCase):
             session = mig.MigrationSession.load(cfg, mailbox)
             self.assertEqual(session.ids, {"m1", "m2"})
             session.close()
+
+    def test_migrate_mailbox_streams_all_messages(self):
+        target = support.FakeIMAP()
+        with mock.patch.object(mig, "authenticate_account",
+                               return_value=("token", None)), \
+                mock.patch.object(mig, "connect_to_target_imap",
+                                  return_value=target):
+            migrated, failed = mig.migrate_mailbox(
+                self.cfg, ("u@example.com", "imap.example.com",
+                           "t@example.com", "pw"))
+        self.assertEqual((migrated, failed), (12, 0))
+        self.assertEqual(len(target.appended), 12)
+
+    def test_restartable_creates_session_file_up_front(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = support.make_cfg(restartable=True, session_dir=tmp)
+            mailbox = ("u@example.com", "imap.example.com", "t@example.com", "pw")
+            with mock.patch.object(mig, "authenticate_account",
+                                   return_value=("token", None)), \
+                    mock.patch.object(mig, "get_mail_folders",
+                                      return_value=support.sample_folders()), \
+                    mock.patch.object(mig, "iter_source_emails",
+                                      return_value=iter([])), \
+                    mock.patch.object(mig, "connect_to_target_imap",
+                                      return_value=support.FakeIMAP()):
+                migrated, failed = mig.migrate_mailbox(cfg, mailbox)
+
+            self.assertEqual((migrated, failed), (0, 0))
+            path = mig.session_path(cfg, mailbox)
+            self.assertTrue(os.path.exists(path))
+            with open(path, encoding="utf-8") as handle:
+                header = json.loads(handle.readline())
+            self.assertEqual(header["type"], "header")
+            self.assertEqual(header["target"], "t@example.com")
+
+    def test_progress_board_unknown_total(self):
+        class Stream:
+            def __init__(self):
+                self.text = ""
+
+            def write(self, value):
+                self.text += value
+
+            def flush(self):
+                pass
+
+            def isatty(self):
+                return False
+
+        stream = Stream()
+        board = mig.ProgressBoard(stream=stream, tty=False, interval=0)
+        key = board.register("x@y.com", None)
+        board.advance(key, True)
+        board.advance(key, True)
+        board.finish(key, "done")
+        self.assertIn("2 done", stream.text)
+        self.assertIn("2/2", stream.text)
+
+    def test_parent_folder_quote_stripping(self):
+        self.assertEqual(mig.normalize_parent_folder("'Office Migration'"),
+                         "Office Migration")
+        self.assertEqual(mig.normalize_parent_folder('"/Archive 2024/"'),
+                         "Archive 2024")
+        self.assertEqual(mig.normalize_parent_folder("Mig/'Office 2024'"),
+                         "Mig/Office 2024")
 
     def test_utf7_and_target_paths(self):
         self.assertEqual(mig.imap_utf7_encode("~peter/mail/台北/日本語"),

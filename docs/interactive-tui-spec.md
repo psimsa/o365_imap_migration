@@ -206,11 +206,15 @@ Validation & plan
   Restartable     on (1 204 message(s) already migrated)
   Attachments     on            Body format   html
   Target parent   Migration 2026  (will be created)
+  Restart command python o365_imap_migration.py --folders ... --restartable
 
 Start the migration? [y/N]
 ```
 
-- The plan never contains the client secret or IMAP password.
+- The plan never contains the client secret or IMAP password, and it prints the exact
+  non-interactive **restart command** (with `--restartable`, filters and a custom
+  `--env-file`) before the confirmation prompt, so it is available if the run is
+  interrupted.
 - **Default is No.** Only an explicit `y`/`yes` starts the migration; `N`, empty input,
   `Ctrl-C` or `Ctrl-D` → `Aborted, nothing written.` exit `2`.
 - If validation found a failure, replace the confirmation prompt with

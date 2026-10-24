@@ -306,6 +306,7 @@ class Plan:
     resume_count: int = 0
     migrate_after: str = ""
     migrate_before: str = ""
+    command: str = ""
 
 
 @dataclass
@@ -345,7 +346,7 @@ def validate_date_text(value):
 
 
 def validate_parent_name(value, delimiter="/"):
-    text = (value or "").strip()
+    text = mig.strip_outer_quotes(value)
     if not text:
         raise ValueError("enter a folder name")
     if delimiter and delimiter in text:
@@ -442,6 +443,29 @@ def _describe_dates(plan):
     return ", ".join(parts) or "none"
 
 
+def build_rerun_command(cfg, env_file=None):
+    """Non-interactive command that reproduces (and resumes) this migration."""
+    parts = ["python", "o365_imap_migration.py"]
+    if env_file and env_file != mig.DEFAULT_ENV:
+        parts += ["--env-file", env_file]
+    if cfg.csv_file != mig.DEFAULT_CSV:
+        parts += ["--csv", cfg.csv_file]
+    if cfg.migrate_folders:
+        parts += ["--folders", ",".join(cfg.migrate_folders)]
+    if cfg.migrate_limit:
+        parts += ["--limit", str(cfg.migrate_limit)]
+    if cfg.migrate_after:
+        parts += ["--after", cfg.migrate_after]
+    if cfg.migrate_before:
+        parts += ["--before", cfg.migrate_before]
+    if cfg.target_parent_folder:
+        parts += ["--target-parent-folder", cfg.target_parent_folder]
+    if cfg.restartable:
+        # --reset-session is intentionally not repeated: a rerun should resume.
+        parts += ["--restartable"]
+    return shlex.join(parts)
+
+
 def plan_rows(plan):
     if len(plan.folders) <= 5:
         folders = ", ".join(plan.folders)
@@ -471,6 +495,7 @@ def plan_rows(plan):
         ("Target parent", parent),
         ("Target folders", f"{plan.create_count} to create, {plan.reuse_count} reused"),
         ("IMAP TLS", "verified" if plan.imap_ssl_verify else "NOT verified"),
+        ("Restart command", plan.command or "-"),
     ]
 
 
@@ -714,8 +739,7 @@ class Wizard:
                            f"delimiter {self.delimiter!r}.")
         if not self.mailbox.from_csv:
             self.save_row = self.prompter.confirm(
-                "Save this mailbox to details.csv after a successful migration?",
-                default=False)
+                "Save this mailbox to details.csv before starting?", default=False)
         self.mailbox = replace(self.mailbox, target_server=server,
                                target_email=target, password=password)
 
@@ -745,8 +769,9 @@ class Wizard:
             validate=lambda v: validate_parent_name(v, self.delimiter),
             completer=roots,
         )
-        matched = match_folder(value, roots)
-        chosen = matched or value.strip()
+        cleaned = mig.strip_outer_quotes(value)
+        matched = match_folder(cleaned, roots)
+        chosen = matched or cleaned
         self.cfg = replace(self.cfg, target_parent_folder=chosen)
         self.renderer.info(f"Parent folder: {chosen} "
                            f"({'existing' if matched else 'will be created'})")
@@ -867,6 +892,11 @@ class Wizard:
 
         plan = build_plan(self.cfg, self.mailbox, self.selected,
                           self.delimiter, self.target_names, resume_count=resume_count)
+        plan.command = build_rerun_command(self.cfg, self.env_path)
+        if not self.mailbox.from_csv and not self.save_row:
+            plan.warnings.append(
+                "the restart command needs this mailbox in details.csv "
+                "(add the row, or rerun the wizard)")
         checks.append(Check("Folder plan", True,
                             f"{plan.create_count} to create, {plan.reuse_count} reused"))
         return checks, plan
@@ -882,20 +912,22 @@ class Wizard:
             self.mail = None
 
     def rerun_command(self):
-        parts = ["python", "o365_imap_migration.py"]
-        if self.cfg.csv_file != mig.DEFAULT_CSV:
-            parts += ["--csv", self.cfg.csv_file]
-        if self.cfg.migrate_folders:
-            parts += ["--folders", ",".join(self.cfg.migrate_folders)]
-        if self.cfg.migrate_limit:
-            parts += ["--limit", str(self.cfg.migrate_limit)]
-        if self.cfg.target_parent_folder:
-            parts += ["--target-parent-folder", self.cfg.target_parent_folder]
-        return shlex.join(parts)
+        return build_rerun_command(self.cfg, self.env_path)
 
     def execute(self):
         self.renderer.step(8, 8, "Migration")
         self.close()
+
+        if self.save_row and not self.mailbox.from_csv:
+            row = (self.mailbox.source_email, self.mailbox.target_server,
+                   self.mailbox.target_email, self.mailbox.password)
+            try:
+                if append_csv_row(self.cfg.csv_file, row):
+                    self.renderer.info(f"Mailbox appended to {self.cfg.csv_file}.")
+                else:
+                    self.renderer.info(f"Mailbox already present in {self.cfg.csv_file}.")
+            except OSError as exc:
+                self.renderer.warn(f"could not save the mailbox row: {exc}")
 
         board = mig.ProgressBoard()
         previous_board = mig._active_board
@@ -915,15 +947,7 @@ class Wizard:
         self.renderer.info(f"Migration finished in {elapsed:.1f}s: "
                            f"{migrated} migrated, {failed} failed.")
 
-        if self.save_row and not self.mailbox.from_csv:
-            row = (self.mailbox.source_email, self.mailbox.target_server,
-                   self.mailbox.target_email, self.mailbox.password)
-            if append_csv_row(self.cfg.csv_file, row):
-                self.renderer.info(f"Mailbox appended to {self.cfg.csv_file}.")
-            else:
-                self.renderer.info(f"Mailbox already present in {self.cfg.csv_file}.")
-
-        self.renderer.info(f"Rerun non-interactively: {self.rerun_command()}")
+        self.renderer.info(f"Restart command: {self.rerun_command()}")
         return 0 if failed == 0 else 1
 
     # -- orchestration -----------------------------------------------------
