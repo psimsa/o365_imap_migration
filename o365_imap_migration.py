@@ -240,7 +240,7 @@ class Config:
     client_id: str
     client_secret: str
     tenant_id: str
-    migrate_attachments: bool = False
+    migrate_attachments: bool = True
     email_format: str = "html"
     imap_ssl_verify: bool = True
     graph_page_size: int = 100
@@ -308,7 +308,7 @@ def load_config(env_file=None, require_credentials=True):
         client_id=(os.getenv("SOURCE_CLIENT_ID") or "").strip(),
         client_secret=(os.getenv("SOURCE_CLIENT_SECRET") or "").strip(),
         tenant_id=(os.getenv("SOURCE_TENANT_ID") or "").strip(),
-        migrate_attachments=env_bool("MIGRATE_ATTACHMENTS", False),
+        migrate_attachments=env_bool("MIGRATE_ATTACHMENTS", True),
         email_format=email_format,
         imap_ssl_verify=env_bool("IMAP_SSL_VERIFY", True),
         graph_page_size=env_int("GRAPH_PAGE_SIZE", 100, 1, 1000),

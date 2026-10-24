@@ -27,6 +27,13 @@ Remote: `origin` -> `git@github.com:psimsa/o365_imap_migration.git` (fork)
 
 ## Verification
 
+- Local venv `.venv` created with CPython 3.14.6 (via `uv`); all pinned dependencies
+  install and the test suite passes on 3.14.6 and on the system 3.12.3. CI matrix now
+  covers 3.10, 3.12 and 3.14.
+- Real tenant: Graph app credentials from `.env` verified; `pavel@simsa.cz` is readable
+  (18 folders, ~50 906 messages) and a sample message with conversion was fetched
+  successfully. Target IMAP not tested yet (no credentials).
+- Attachments now default to on (`MIGRATE_ATTACHMENTS=true`); `EMAIL_FORMAT` stays `html`.
 - `python -m py_compile o365_imap_migration.py`
 - Stub harness (24 checks): Graph paging/limits, folder filters and subtree matching,
   parent-folder creation + UTF-7 wire names, TLS `CERT_REQUIRED`/opt-out, default-mapping
@@ -50,6 +57,8 @@ Remote: `origin` -> `git@github.com:psimsa/o365_imap_migration.git` (fork)
 ## Next / open questions
 
 - [ ] Run a real end-to-end trial (`--dry-run`, then `--limit 25`) and tag `1.1.0`.
+      Needs the source O365 mailbox address and IMAP server/password for
+      `pavel@simsa.cz` (not provided yet).
 - [ ] `Bcc` recipients are folded into the `To` header.
 - [ ] `INTERNALDATE` is migration time rather than `receivedDateTime`.
 - [ ] Original `Message-ID`/`Reply-To` headers are lost during re-rendering.

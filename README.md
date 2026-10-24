@@ -10,7 +10,9 @@ Microsoft Graph, and appends each message to the target IMAP account.
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.10+ (tested with CPython 3.10, 3.12 and 3.14)
+- A virtual environment is recommended:
+  `python3 -m venv .venv && source .venv/bin/activate`
 - `python -m pip install -r requirements.txt`
 - Optional, for the interactive wizard: `python -m pip install -r requirements-tui.txt`
 - An Entra app registration with **application** permissions (not delegated) and
@@ -122,8 +124,9 @@ fuzzy completer. Feedback on the flow is welcome before it is finalised.
 | `--folders LIST` | `MIGRATE_FOLDERS` | all | Comma-separated source folders or paths; a folder also selects its subtree |
 | `--limit N` | `MIGRATE_LIMIT` | `0` (all) | At most N messages per mailbox, newest first |
 
-Other `.env` settings: `MIGRATE_ATTACHMENTS`, `EMAIL_FORMAT` (`html`/`plain`),
-`IMAP_SSL_VERIFY`, `GRAPH_PAGE_SIZE`, plus the three `SOURCE_*` credentials.
+Other `.env` settings: `MIGRATE_ATTACHMENTS` (default **on**), `EMAIL_FORMAT`
+(`html` by default, or `plain`), `IMAP_SSL_VERIFY`, `GRAPH_PAGE_SIZE`, plus the three
+`SOURCE_*` credentials.
 
 ## Behaviour
 

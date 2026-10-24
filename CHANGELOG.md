@@ -22,7 +22,7 @@ Planned release: `1.1.0`. Everything below is on `feature/interactive-tui`
 - Optional TUI dependencies in `requirements-tui.txt` (`rich`, `prompt_toolkit`); batch
   mode does not import them.
 - Unit-test suite (27 tests, hermetic fake Graph/IMAP backends) and a GitHub Actions
-  workflow running it on Python 3.10 and 3.12.
+  workflow running it on Python 3.10, 3.12 and 3.14.
 - `--dry-run`: authenticates against Graph, lists source folders, reads and converts one
   real message, logs in to every target IMAP server (TLS verified) and reports the folder
   mapping, folders to create and per-mailbox OK/FAIL. Writes nothing; exit code `0`/`1`.
@@ -43,6 +43,8 @@ Planned release: `1.1.0`. Everything below is on `feature/interactive-tui`
 
 ### Changed
 
+- Attachments are now enabled by default (`MIGRATE_ATTACHMENTS=true`); `EMAIL_FORMAT`
+  keeps its `html` default.
 - `load_config()` accepts `require_credentials=False` so the wizard can prompt for missing
   `SOURCE_*` values; `migrate_mailbox()` now returns `(migrated, failed)` for callers.
 - Configuration moved from `config.json` to a gitignored `.env` (`python-dotenv`).

@@ -84,6 +84,7 @@ class CoreTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=True):
                 cfg = mig.load_config(env_file=env_path, require_credentials=False)
                 self.assertEqual(cfg.client_id, "")
+                self.assertTrue(cfg.migrate_attachments)
                 with self.assertRaises(mig.MigrationError):
                     mig.load_config(env_file=env_path, require_credentials=True)
 
@@ -97,6 +98,11 @@ class CoreTests(unittest.TestCase):
             migrated, failed = mig.migrate_mailbox(
                 self.cfg, ("u@example.com", "imap.example.com", "t@example.com", "pw"))
         self.assertEqual((migrated, failed), (2, 0))
+
+    def test_defaults_enable_attachments_and_html(self):
+        cfg = mig.Config(client_id="", client_secret="", tenant_id="")
+        self.assertTrue(cfg.migrate_attachments)
+        self.assertEqual(cfg.email_format, "html")
 
     def test_utf7_and_target_paths(self):
         self.assertEqual(mig.imap_utf7_encode("~peter/mail/台北/日本語"),
