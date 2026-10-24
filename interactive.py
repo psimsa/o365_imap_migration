@@ -703,6 +703,9 @@ class Wizard:
                           if folder.get("totalItemCount")] or self.selected
             if not candidates:
                 return Check("Sample message", False, "no folders selected")
+            # Prefer Inbox: it is representative and usually smaller than
+            # system folders such as "Sync Issues".
+            candidates.sort(key=lambda item: item["displayName"] != "Inbox")
             folder = candidates[0]
             page = mig.graph_get(
                 f"{mig._user_url(self.mailbox.source_email)}"

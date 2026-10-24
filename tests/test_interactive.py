@@ -193,6 +193,8 @@ class FlowTests(unittest.TestCase):
                             for kind, question in prompter.prompts))
         self.assertTrue(any("Validation & plan" in line
                             for line in self.renderer.lines))
+        self.assertTrue(any("Sample message" in line and "Inbox" in line
+                            for line in self.renderer.lines))
         migrate_mock = mig.migrate_mailbox
         self.assertEqual(migrate_mock.call_count, 1)
         mailbox = migrate_mock.call_args.args[1]
