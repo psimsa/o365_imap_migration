@@ -23,7 +23,7 @@ import ssl
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email import encoders
 from email.mime.base import MIMEBase
@@ -70,23 +70,167 @@ class GraphError(Exception):
     """A Microsoft Graph request failed."""
 
 
-# Thread-safe printing -------------------------------------------------------
+# Printing and progress ------------------------------------------------------
 
 print_lock = threading.Lock()
+_active_board: Optional["ProgressBoard"] = None
 
 
 def safe_print(message, end="\n"):
-    """Thread-safe print function that flushes the output immediately."""
+    """Print from any thread; routed through the progress board when active."""
+    board = _active_board
+    if board is not None:
+        board.notify(message)
+        return
     with print_lock:
         print(message, end=end, flush=True)
 
 
-def update_progress(message, final=False):
-    """Updates progress by safely printing a message."""
-    if final:
-        safe_print(message)
-    else:
-        safe_print(message, end="\r")
+class ProgressBoard:
+    """Per-mailbox migration progress.
+
+    On a terminal the board redraws a block of one line per mailbox in place.
+    When the output is redirected it emits one line per mailbox every few
+    seconds (and on completion), which keeps CI logs readable.
+    """
+
+    def __init__(self, stream=None, tty=None, interval=2.0):
+        self.stream = stream or sys.stdout
+        self.tty = self.stream.isatty() if tty is None else tty
+        self.interval = interval
+        self.lock = threading.RLock()
+        self.rows = {}
+        self.order = []
+        self.drawn = 0
+
+    # -- public API ---------------------------------------------------------
+
+    def register(self, label, total):
+        """Adds a mailbox row and returns its (unique) key."""
+        with self.lock:
+            key = label
+            suffix = 2
+            while key in self.rows:
+                key = f"{label} #{suffix}"
+                suffix += 1
+            self.rows[key] = {
+                "total": max(int(total), 0),
+                "done": 0,
+                "migrated": 0,
+                "failed": 0,
+                "started": time.monotonic(),
+                "last_emit": 0.0,
+                "folder": "",
+                "status": "running",
+            }
+            self.order.append(key)
+            self._render(key, force=True)
+            return key
+
+    def set_folder(self, key, folder):
+        with self.lock:
+            if key in self.rows:
+                self.rows[key]["folder"] = folder
+                self._render(key)
+
+    def advance(self, key, ok=True):
+        with self.lock:
+            row = self.rows.get(key)
+            if row is None:
+                return
+            row["done"] += 1
+            if ok:
+                row["migrated"] += 1
+            else:
+                row["failed"] += 1
+            self._render(key)
+
+    def finish(self, key, status="done"):
+        with self.lock:
+            row = self.rows.get(key)
+            if row is None:
+                return
+            row["status"] = status
+            if not self.tty:
+                self._render(key, force=True)
+                return
+            self._draw_all()
+            # Commit the block to the scrollback once every mailbox is done.
+            if all(item["status"] != "running" for item in self.rows.values()):
+                self._clear()
+                for order_key in self.order:
+                    self.stream.write(self._format(order_key) + "\n")
+                self.drawn = 0
+                self.stream.flush()
+
+    def log(self, key, message):
+        self.notify(f"[{key}] {message}")
+
+    def notify(self, message):
+        """Prints a message without corrupting the redrawn block."""
+        with self.lock:
+            if self.tty:
+                self._clear()
+            self.stream.write(str(message) + "\n")
+            if self.tty:
+                self._draw_all()
+            else:
+                self.stream.flush()
+
+    # -- rendering ----------------------------------------------------------
+
+    def _format(self, key):
+        row = self.rows[key]
+        total = row["total"]
+        done = row["done"]
+        percent = (100.0 * done / total) if total else 100.0
+        elapsed = max(time.monotonic() - row["started"], 1e-9)
+        rate = done / elapsed
+
+        if done and done < total:
+            seconds = int((total - done) / rate) if rate else 0
+            eta = f"ETA {seconds // 60}d{seconds % 60:02d}s"
+        elif done >= total:
+            eta = "ETA done"
+        else:
+            eta = "ETA --"
+
+        folder = row["folder"] or "-"
+        if len(folder) > 32:
+            folder = "..." + folder[-29:]
+
+        return (f"[{key}] {done}/{total} {percent:5.1f}% | {row['migrated']} ok, "
+                f"{row['failed']} failed | {rate:5.1f} msg/s | {eta} | {folder} | "
+                f"{row['status']}")
+
+    def _render(self, key, force=False):
+        if self.tty:
+            self._draw_all()
+            return
+
+        row = self.rows[key]
+        now = time.monotonic()
+        if not force and row["done"] < row["total"] and (now - row["last_emit"]) < self.interval:
+            return
+        row["last_emit"] = now
+        self.stream.write(self._format(key) + "\n")
+        self.stream.flush()
+
+    def _clear(self):
+        if not self.drawn:
+            return
+        self.stream.write(f"\x1b[{self.drawn}A")
+        for _ in range(self.drawn):
+            self.stream.write("\x1b[2K\n")
+        self.stream.write(f"\x1b[{self.drawn}A")
+        self.drawn = 0
+
+    def _draw_all(self):
+        self._clear()
+        for key in self.order:
+            self.stream.write("\x1b[2K" + self._format(key) + "\n")
+        self.drawn = len(self.order)
+        self.stream.flush()
 
 
 # Configuration --------------------------------------------------------------
@@ -101,6 +245,9 @@ class Config:
     imap_ssl_verify: bool = True
     graph_page_size: int = 100
     csv_file: str = DEFAULT_CSV
+    target_parent_folder: str = ""
+    migrate_folders: list[str] = field(default_factory=list)
+    migrate_limit: int = 0  # 0 = everything
 
 
 def env_bool(name, default=False):
@@ -121,6 +268,16 @@ def env_int(name, default, low, high):
     if not low <= value <= high:
         raise MigrationError(f"{name} must be between {low} and {high}, got {value}")
     return value
+
+
+def parse_folder_list(value):
+    """Splits a comma-separated folder list, dropping empty entries."""
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+def normalize_parent_folder(value):
+    """Normalizes a target parent folder to 'A/B' form (no leading/trailing slash)."""
+    return "/".join(part.strip() for part in (value or "").split("/") if part.strip())
 
 
 def load_config(env_file=None):
@@ -150,6 +307,9 @@ def load_config(env_file=None):
         imap_ssl_verify=env_bool("IMAP_SSL_VERIFY", True),
         graph_page_size=env_int("GRAPH_PAGE_SIZE", 100, 1, 1000),
         csv_file=(os.getenv("CSV_FILE") or DEFAULT_CSV).strip(),
+        target_parent_folder=normalize_parent_folder(os.getenv("TARGET_PARENT_FOLDER", "")),
+        migrate_folders=parse_folder_list(os.getenv("MIGRATE_FOLDERS", "")),
+        migrate_limit=env_int("MIGRATE_LIMIT", 0, 0, 1_000_000_000),
     )
 
 
@@ -169,24 +329,25 @@ def read_mailboxes_from_csv(filename):
         except StopIteration:
             raise MigrationError(f"{filename} is empty.") from None
         if header != CSV_HEADER:
-            print(f"Warning: unexpected header in {filename}: {header}. Expected: {CSV_HEADER}")
+            safe_print(f"Warning: unexpected header in {filename}: {header}. "
+                       f"Expected: {CSV_HEADER}")
 
         for line_number, row in enumerate(reader, start=2):
             row = [cell.strip() for cell in row]
             if not any(row):
                 continue
             if len(row) != len(CSV_HEADER):
-                print(f"Warning: skipping {filename}:{line_number}: expected "
-                      f"{len(CSV_HEADER)} columns, got {len(row)}.")
+                safe_print(f"Warning: skipping {filename}:{line_number}: expected "
+                           f"{len(CSV_HEADER)} columns, got {len(row)}.")
                 continue
             source_email, target_server, target_email, target_password = row
             if not all(row):
-                print(f"Warning: skipping {filename}:{line_number}: empty value in row.")
+                safe_print(f"Warning: skipping {filename}:{line_number}: empty value in row.")
                 continue
             key = (source_email.lower(), target_server.lower(), target_email.lower())
             if key in seen:
-                print(f"Warning: skipping {filename}:{line_number}: duplicate entry for "
-                      f"{source_email} -> {target_email}.")
+                safe_print(f"Warning: skipping {filename}:{line_number}: duplicate entry for "
+                           f"{source_email} -> {target_email}.")
                 continue
             seen.add(key)
             mailboxes.append((source_email, target_server, target_email, target_password))
@@ -243,7 +404,7 @@ def graph_get(url, access_token, params=None, timeout=60, max_attempts=5):
     raise GraphError(f"GET {url} failed after {max_attempts} attempts: {last_error}")
 
 
-def graph_get_all(url, access_token, params=None, timeout=60):
+def graph_get_all(url, access_token, params=None, timeout=60, limit=None, on_page=None):
     """GET every page of a Graph collection by following @odata.nextLink.
 
     Graph returns at most 10 items per page by default, so ignoring
@@ -251,12 +412,16 @@ def graph_get_all(url, access_token, params=None, timeout=60):
     """
     items = []
     next_url, next_params = url, params
-    while next_url:
+    while next_url and (limit is None or len(items) < limit):
         page = graph_get(next_url, access_token, params=next_params, timeout=timeout)
         items.extend(page.get("value", []))
+        if on_page is not None:
+            on_page(len(items))
         next_url = page.get("@odata.nextLink")
         # The nextLink already carries the query string of the original request.
         next_params = None
+    if limit is not None:
+        items = items[:limit]
     return items
 
 
@@ -282,11 +447,36 @@ def get_mail_folders(cfg, access_token, user_email):
             children = graph_get_all(f"{base}/{folder['id']}/childFolders", access_token,
                                      params={"$top": 100})
         except GraphError as e:
-            print(f"Warning: could not list child folders of '{path}': {e}")
+            safe_print(f"Warning: could not list child folders of '{path}': {e}")
             continue
         stack.extend((child, f"{path}/{child.get('displayName') or 'Unknown'}")
                      for child in children)
     return folders
+
+
+def select_folders(folders, requested):
+    """Filters folders by path/display name; a match also selects its subtree."""
+    wanted = list(dict.fromkeys(
+        name.strip().strip("/").lower() for name in (requested or []) if name.strip()))
+    if not wanted:
+        return folders, []
+    wanted_set = set(wanted)
+
+    selected = []
+    matched = set()
+    for folder in folders:
+        path = folder["path"].lower()
+        parts = path.split("/")
+        candidates = {path, folder["displayName"].lower()}
+        for index in range(1, len(parts) + 1):
+            candidates.add("/".join(parts[:index]))
+        hit = candidates & wanted_set
+        if hit:
+            selected.append(folder)
+            matched.update(hit)
+
+    missing = [name for name in wanted if name not in matched]
+    return selected, missing
 
 
 def fetch_attachments(access_token, email_address, message_id):
@@ -296,35 +486,62 @@ def fetch_attachments(access_token, email_address, message_id):
 
 
 def fetch_all_emails(cfg, source_email, access_token):
-    """Fetch all emails from the source email account."""
+    """Fetch the selected emails from the source email account."""
     folders = get_mail_folders(cfg, access_token, source_email)
+    selected, missing = select_folders(folders, cfg.migrate_folders)
+    for name in missing:
+        safe_print(f"[{source_email}] warning: source folder not found: {name!r}")
+    if not selected:
+        safe_print(f"[{source_email}] no source folders matched {cfg.migrate_folders!r}.")
+        return []
+
+    remaining = cfg.migrate_limit or None
     all_emails = []
 
-    for folder in folders:
+    for folder in selected:
+        if remaining is not None and remaining <= 0:
+            break
+
+        top = cfg.graph_page_size if remaining is None else min(cfg.graph_page_size, remaining)
+        last_report = [0.0]
+
+        def on_page(count, path=folder["path"]):
+            now = time.monotonic()
+            if now - last_report[0] >= 2.0:
+                last_report[0] = now
+                safe_print(f"[{source_email}] {path}: {count} message(s) fetched")
+
         try:
             messages = graph_get_all(
                 f"{_user_url(source_email)}/mailFolders/{folder['id']}/messages",
                 access_token,
-                params={"$top": cfg.graph_page_size},
+                params={"$top": top},
+                limit=remaining,
+                on_page=on_page,
             )
         except GraphError as e:
-            print(f"Failed to fetch emails from folder '{folder['path']}': {e}")
+            safe_print(f"[{source_email}] failed to fetch emails from folder "
+                       f"'{folder['path']}': {e}")
             continue
 
         for message in messages:
             message["folderName"] = folder["displayName"]
+            message["folderPath"] = folder["path"]
             if cfg.migrate_attachments:
                 try:
                     message["attachments"] = fetch_attachments(
                         access_token, source_email, message["id"])
                 except GraphError as e:
-                    print(f"Failed to fetch attachments for message {message.get('id')}: {e}")
+                    safe_print(f"[{source_email}] failed to fetch attachments for message "
+                               f"{message.get('id')}: {e}")
                     message["attachments"] = []
 
         all_emails.extend(messages)
-        update_progress(f"Fetched {len(messages)} emails from {folder['path']}.")
+        safe_print(f"[{source_email}] {folder['path']}: {len(messages)} message(s) fetched")
 
-    safe_print("")
+        if remaining is not None:
+            remaining -= len(messages)
+
     return all_emails
 
 
@@ -394,7 +611,8 @@ def convert_to_rfc822(cfg, msg):
             for attachment in attachments:
                 content_bytes = attachment.get("contentBytes")
                 if not content_bytes:
-                    print(f"Skipping attachment without content: {attachment.get('name')!r}")
+                    safe_print(f"Skipping attachment without content: "
+                               f"{attachment.get('name')!r}")
                     continue
                 try:
                     filename = str(attachment.get("name") or "unknown")
@@ -407,7 +625,7 @@ def convert_to_rfc822(cfg, msg):
                         "Content-Disposition", f'attachment; filename="{filename}"')
                     email_msg.attach(mime_attachment)
                 except Exception as e:
-                    print(f"Error processing attachment {attachment.get('name')!r}: {e}")
+                    safe_print(f"Error processing attachment {attachment.get('name')!r}: {e}")
         else:
             email_msg = MIMEText(body, subtype, "utf-8")
 
@@ -419,7 +637,7 @@ def convert_to_rfc822(cfg, msg):
         return email_msg.as_string()
 
     except Exception as e:
-        print(f"Conversion error for message {msg.get('id')!r}: {e}")
+        safe_print(f"Conversion error for message {msg.get('id')!r}: {e}")
         return None
 
 
@@ -470,7 +688,7 @@ def authenticate_account(cfg, target_email, force_reauth=True):
         authenticated = False
 
     if not authenticated:
-        print(f"Authenticating against Microsoft Graph for {target_email}.")
+        safe_print(f"Authenticating against Microsoft Graph for {target_email}.")
         if not account.authenticate():
             raise MigrationError(f"authentication failed for {target_email}")
 
@@ -478,7 +696,7 @@ def authenticate_account(cfg, target_email, force_reauth=True):
     if not access_token:
         raise MigrationError(f"no access token available for {target_email}")
 
-    update_progress(f"Successfully authenticated for {target_email}.")
+    safe_print(f"Successfully authenticated for {target_email}.")
     return access_token, account
 
 
@@ -500,30 +718,31 @@ def connect_to_target_imap(cfg, server, email_user, password=None, timeout=30):
         mail.login(email_user, password)
         mail.noop()
     except ssl.SSLError as e:
-        print(f"TLS error connecting to {server}: {e}")
+        safe_print(f"TLS error connecting to {server}: {e}")
         return None
     except imaplib.IMAP4.error as e:
-        print(f"Failed to connect to {server}: {e}")
+        safe_print(f"Failed to connect to {server}: {e}")
         return None
     except OSError as e:
-        print(f"Network error connecting to {server}: {e}")
+        safe_print(f"Network error connecting to {server}: {e}")
         return None
 
     verification = "TLS certificate verified" if cfg.imap_ssl_verify else \
         "TLS certificate NOT verified"
-    print(f"Successfully connected to {server} as {email_user} ({verification}).")
+    safe_print(f"Successfully connected to {server} as {email_user} ({verification}).")
     return mail
 
 
 IMAP_LIST_RE = re.compile(r'^\((?P<flags>[^)]*)\)\s+(?P<delim>NIL|"(?:[^"\\]|\\.)*")\s+(?P<name>.+)$')
 
 
-def list_imap_folders(mail):
-    """Returns the folder names reported by IMAP LIST."""
+def get_imap_hierarchy(mail):
+    """Returns the IMAP hierarchy delimiter and the existing mailbox names."""
     status, data = mail.list()
     if status != "OK":
         raise MigrationError(f"IMAP LIST failed: {data!r}")
 
+    delimiter = "/"
     names = []
     for item in data or []:
         if item is None:
@@ -532,109 +751,239 @@ def list_imap_folders(mail):
         match = IMAP_LIST_RE.match(line.strip())
         if not match:
             continue
+        raw_delimiter = match.group("delim")
+        if raw_delimiter != "NIL":
+            delimiter = raw_delimiter.strip('"')
         name = match.group("name").strip()
         if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
             name = name[1:-1].replace('\\"', '"')
         names.append(name)
-    return names
+    return delimiter, names
 
 
-def get_target_folders():
-    """Mapping of Outlook folder names to target IMAP folder names."""
-    return dict(TARGET_FOLDER_MAP)
+def list_imap_folders(mail):
+    """Returns the folder names reported by IMAP LIST."""
+    return get_imap_hierarchy(mail)[1]
 
 
-def migrate_emails(cfg, target_mail, messages):
-    """Migrates emails from a list of message dictionaries to a target email account."""
-    target_folders = get_target_folders()
-    total_messages = len(messages)
+def imap_utf7_encode(value):
+    """Encodes a mailbox name as IMAP modified UTF-7 (RFC 3501 section 5.1.3)."""
+    encoded = []
+    pending = []
+
+    def flush():
+        if pending:
+            data = "".join(pending).encode("utf-16-be")
+            text = base64.b64encode(data).decode("ascii").replace("/", ",").rstrip("=")
+            encoded.append(f"&{text}-")
+            pending.clear()
+
+    for char in value:
+        if 0x20 <= ord(char) <= 0x7E:
+            flush()
+            encoded.append("&-" if char == "&" else char)
+        else:
+            pending.append(char)
+    flush()
+    return "".join(encoded)
+
+
+def imap_quote(name):
+    """Quotes a mailbox name for CREATE/APPEND commands."""
+    return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def sanitize_folder_component(name):
+    name = re.sub(r"[\x00-\x1f\x7f]", "", str(name)).strip()
+    if name in ("", ".", ".."):
+        return "Unnamed"
+    return name[:100]
+
+
+def build_target_path(cfg, source_path, delimiter):
+    """Target mailbox path for a source folder path (unencoded)."""
+    parent = [sanitize_folder_component(part)
+              for part in cfg.target_parent_folder.split("/") if part.strip()]
+    parts = [sanitize_folder_component(part)
+             for part in str(source_path or "Inbox").split("/") if part.strip()]
+    if not parts:
+        parts = ["Inbox"]
+
+    components = parent + parts
+    if delimiter != "/":
+        # A name containing the delimiter would accidentally nest on the target.
+        components = [part.replace(delimiter, "_") for part in components]
+    return delimiter.join(components)
+
+
+def _create_mailbox(mail, wire_name):
+    try:
+        status, data = mail.create(imap_quote(wire_name))
+    except imaplib.IMAP4.error as e:
+        return False, str(e)
+    if status == "OK":
+        return True, ""
+
+    parts = []
+    for item in data or []:
+        if isinstance(item, bytes):
+            parts.append(item.decode("utf-8", "replace"))
+        elif item is not None:
+            parts.append(str(item))
+    return False, " ".join(parts)
+
+
+def ensure_target_folder(mail, path, delimiter, state):
+    """Creates missing mailboxes (parents first) and returns the wire name."""
+    wire_name = imap_utf7_encode(path)
+    if wire_name.lower() in state["existing"]:
+        return wire_name
+
+    current = ""
+    for part in path.split(delimiter):
+        current = part if not current else f"{current}{delimiter}{part}"
+        wire_part = imap_utf7_encode(current)
+        if wire_part.lower() in state["existing"]:
+            continue
+
+        created, detail = _create_mailbox(mail, wire_part)
+        if created:
+            safe_print(f"Created target folder '{current}'")
+        elif "exist" not in detail.lower():
+            safe_print(f"Could not create target folder '{current}': {detail}")
+        # Remember the attempt so every message does not retry CREATE.
+        state["existing"].add(wire_part.lower())
+
+    return wire_name
+
+
+def default_target_folder(display_name, state, warned):
+    """Maps a standard Outlook folder to the target, falling back to INBOX."""
+    candidate = TARGET_FOLDER_MAP.get(display_name, "INBOX")
+    wire_name = imap_utf7_encode(candidate)
+    if wire_name.lower() not in state["existing"]:
+        if candidate.upper() != "INBOX" and display_name not in warned:
+            warned.add(display_name)
+            safe_print(f"Target folder '{candidate}' does not exist; "
+                       f"'{display_name}' falls back to INBOX")
+        wire_name = imap_utf7_encode("INBOX")
+    return wire_name
+
+
+def _append_with_retries(mail, wire_folder, payload, attempts=3):
+    for attempt in range(1, attempts + 1):
+        try:
+            status, response = mail.append(
+                imap_quote(wire_folder), None,
+                imaplib.Time2Internaldate(time.time()), payload,
+            )
+        except (OSError, imaplib.IMAP4.abort) as e:
+            if attempt == attempts:
+                safe_print(f"Append failed after {attempts} attempts: {e}")
+                return False
+            time.sleep(2)
+            continue
+        except Exception as e:
+            safe_print(f"Append failed: {e}")
+            return False
+
+        if status == "OK":
+            return True
+        safe_print(f"Append to '{wire_folder}' failed: {response}")
+        return False
+    return False
+
+
+def migrate_emails(cfg, target_mail, messages, board=None, key=None):
+    """Migrates a list of Graph message dictionaries to the target account."""
+    delimiter, existing = get_imap_hierarchy(target_mail)
+    state = {"existing": {name.lower() for name in existing}}
+    warned = set()
     migrated = failed = 0
+    current_folder = None
 
-    for idx, msg in enumerate(messages):
+    for msg in messages:
+        ok = False
         try:
             if not isinstance(msg, dict):
-                update_progress(f"Unexpected message format: {msg!r}")
-                failed += 1
+                safe_print(f"Unexpected message format: {msg!r}")
             else:
-                source_folder = msg.get("folderName", "Inbox")
-                target_folder_name = target_folders.get(source_folder, "INBOX")
+                source_path = msg.get("folderPath") or msg.get("folderName") or "Inbox"
+
+                if cfg.target_parent_folder:
+                    target_path = build_target_path(cfg, source_path, delimiter)
+                    wire_folder = ensure_target_folder(
+                        target_mail, target_path, delimiter, state)
+                    display_folder = target_path
+                else:
+                    display_folder = msg.get("folderName") or "Inbox"
+                    wire_folder = default_target_folder(display_folder, state, warned)
+
+                if board is not None and key is not None and display_folder != current_folder:
+                    current_folder = display_folder
+                    board.set_folder(key, display_folder)
 
                 email_message = convert_to_rfc822(cfg, msg)
                 if not isinstance(email_message, str):
-                    update_progress(f"Email conversion failed for message: {msg.get('id')}")
-                    failed += 1
+                    safe_print(f"Email conversion failed for message: {msg.get('id')}")
                 else:
-                    email_message_bytes = email_message.encode("utf-8")
-                    for attempt in range(3):
-                        try:
-                            status, response = target_mail.append(
-                                target_folder_name, None,
-                                imaplib.Time2Internaldate(time.time()), email_message_bytes,
-                            )
-                        except (OSError, imaplib.IMAP4.abort) as e:
-                            if attempt == 2:
-                                update_progress(f"Error appending message: {e}")
-                                failed += 1
-                            else:
-                                time.sleep(2)
-                            continue
-                        except Exception as e:
-                            update_progress(f"Error appending message: {e}")
-                            failed += 1
-                            break
-
-                        if status != "OK":
-                            update_progress(f"Failed to append message to {target_folder_name}: "
-                                            f"{response}")
-                            failed += 1
-                        else:
-                            migrated += 1
-                        break
-
-            progress_percentage = (idx + 1) / total_messages * 100
-            update_progress(f"Migrating Emails: {progress_percentage:.2f}% ({idx + 1}/{total_messages})")
+                    ok = _append_with_retries(
+                        target_mail, wire_folder, email_message.encode("utf-8"))
 
         except Exception as e:
+            safe_print(f"Error migrating email: {e}")
+
+        if ok:
+            migrated += 1
+        else:
             failed += 1
-            update_progress(f"Error migrating email: {e}")
+        if board is not None and key is not None:
+            board.advance(key, ok)
 
     return migrated, failed
 
 
-def migrate_mailbox(cfg, mailbox):
+def migrate_mailbox(cfg, mailbox, board=None):
     """Migrates a single mailbox."""
     source_email, target_server, target_email, target_password = mailbox
-    update_progress(f"Starting migration from {source_email} to {target_email}.")
+    safe_print(f"[{source_email}] starting migration to {target_email} ({target_server})")
 
+    key = None
     try:
         access_token, _ = authenticate_account(cfg, source_email)
-        safe_print("")
         messages = fetch_all_emails(cfg, source_email, access_token)
         if not messages:
-            update_progress(f"No messages to migrate from {source_email}.", final=True)
+            safe_print(f"[{source_email}] no messages to migrate.")
             return
 
+        safe_print(f"[{source_email}] fetched {len(messages)} message(s); "
+                   f"connecting to {target_server}")
         target_mail = connect_to_target_imap(cfg, target_server, target_email, target_password)
         if target_mail is None:
-            update_progress(f"Failed to connect to target IMAP server for {target_email}.",
-                            final=True)
+            safe_print(f"[{source_email}] failed to connect to target IMAP server {target_server}")
             return
 
+        if board is not None:
+            key = board.register(source_email, len(messages))
+
         try:
-            migrated, failed = migrate_emails(cfg, target_mail, messages)
+            migrated, failed = migrate_emails(cfg, target_mail, messages, board, key)
         finally:
             try:
                 target_mail.logout()
             except Exception:
                 pass
 
-        safe_print("")
-        update_progress(f"Migration finished for {source_email} -> {target_email}: "
-                        f"{migrated} migrated, {failed} failed.", final=True)
+        if board is not None and key is not None:
+            board.finish(key, "done" if failed == 0 else "done with errors")
+        else:
+            safe_print(f"[{source_email}] finished: {migrated} migrated, {failed} failed "
+                       f"-> {target_email}")
 
     except Exception as e:
-        safe_print("")
-        update_progress(f"Migration failed for {source_email}: {e}", final=True)
+        if board is not None and key is not None:
+            board.finish(key, "failed")
+        safe_print(f"[{source_email}] migration failed: {e}")
 
 
 # Dry run --------------------------------------------------------------------
@@ -644,7 +993,7 @@ def _report(label, ok, detail=""):
     line = f"  {label:<26} {status}"
     if detail:
         line += f" {detail}"
-    print(line)
+    safe_print(line)
 
 
 def _sample_message(cfg, access_token, source_email, folders):
@@ -665,32 +1014,43 @@ def _sample_message(cfg, access_token, source_email, folders):
 
     message = messages[0]
     message["folderName"] = folder["displayName"]
+    message["folderPath"] = folder["path"]
     if cfg.migrate_attachments:
         message["attachments"] = fetch_attachments(access_token, source_email, message["id"])
     return folder, convert_to_rfc822(cfg, message)
 
 
+def _describe_filters(cfg):
+    parts = []
+    parts.append(f"folders={','.join(cfg.migrate_folders)}" if cfg.migrate_folders
+                 else "folders=all")
+    parts.append(f"limit={cfg.migrate_limit or 'all'}")
+    parts.append(f"target parent={cfg.target_parent_folder or '(none)'}")
+    return ", ".join(parts)
+
+
 def dry_run(cfg, mailboxes):
     """Verify Graph credentials, mailbox access, IMAP logins. Writes nothing."""
-    print("=" * 78)
-    print("DRY RUN - no messages will be written to any target mailbox")
-    print(f"  body format ......... {cfg.email_format}")
-    print(f"  attachments ......... {'on' if cfg.migrate_attachments else 'off'}")
-    print(f"  graph page size ..... {cfg.graph_page_size}")
-    print(f"  IMAP TLS verify ..... {'on' if cfg.imap_ssl_verify else 'OFF (insecure)'}")
-    print("=" * 78)
+    safe_print("=" * 78)
+    safe_print("DRY RUN - no messages will be written to any target mailbox")
+    safe_print(f"  body format ......... {cfg.email_format}")
+    safe_print(f"  attachments ......... {'on' if cfg.migrate_attachments else 'off'}")
+    safe_print(f"  graph page size ..... {cfg.graph_page_size}")
+    safe_print(f"  IMAP TLS verify ..... {'on' if cfg.imap_ssl_verify else 'OFF (insecure)'}")
+    safe_print(f"  selection ........... {_describe_filters(cfg)}")
+    safe_print("=" * 78)
 
     failures = 0
     for index, (source_email, target_server, target_email, target_password) in \
             enumerate(mailboxes, start=1):
-        print(f"\n[{index}/{len(mailboxes)}] {source_email}  ->  {target_email}  @ {target_server}")
+        safe_print(f"\n[{index}/{len(mailboxes)}] {source_email}  ->  {target_email}  "
+                   f"@ {target_server}")
         mailbox_ok = True
 
         access_token = None
         folders = []
         try:
             access_token, _ = authenticate_account(cfg, source_email, force_reauth=False)
-            safe_print("")
             _report("Graph authentication", True, f"tenant {cfg.tenant_id}")
         except Exception as e:
             mailbox_ok = False
@@ -698,9 +1058,18 @@ def dry_run(cfg, mailboxes):
 
         if access_token:
             try:
-                folders = get_mail_folders(cfg, access_token, source_email)
+                all_folders = get_mail_folders(cfg, access_token, source_email)
+                folders, missing = select_folders(all_folders, cfg.migrate_folders)
                 total = sum(f["totalItemCount"] for f in folders)
-                _report("Mail folders", True, f"{len(folders)} folder(s), ~{total} message(s)")
+                detail = f"{len(folders)} of {len(all_folders)} folder(s)"
+                if cfg.migrate_limit:
+                    detail += f", up to {cfg.migrate_limit} message(s) (of ~{total})"
+                else:
+                    detail += f", ~{total} message(s)"
+                _report("Mail folders", True, detail)
+                for name in missing:
+                    _report("  filter", False, f"folder not found: {name!r}")
+                    mailbox_ok = False
             except Exception as e:
                 mailbox_ok = False
                 _report("Mail folders", False, str(e))
@@ -709,7 +1078,7 @@ def dry_run(cfg, mailboxes):
             try:
                 folder, rfc822 = _sample_message(cfg, access_token, source_email, folders)
                 if folder is None:
-                    _report("Sample message", True, "skipped, no messages in mailbox")
+                    _report("Sample message", True, "skipped, no messages in selection")
                 elif rfc822 is None:
                     mailbox_ok = False
                     _report("Sample message", False, "message conversion failed")
@@ -727,22 +1096,38 @@ def dry_run(cfg, mailboxes):
             _report("IMAP login + TLS", False, target_server)
         else:
             try:
-                target_names = list_imap_folders(target_mail)
-                _report("IMAP login + TLS", True, f"{len(target_names)} folder(s)")
+                delimiter, target_names = get_imap_hierarchy(target_mail)
+                _report("IMAP login + TLS", True, f"{len(target_names)} folder(s), "
+                                                  f"delimiter {delimiter!r}")
 
                 if folders:
-                    mapping = get_target_folders()
-                    fallback = [
-                        f["path"] for f in folders
-                        if mapping.get(f["displayName"], "INBOX") not in target_names
-                    ]
-                    if fallback:
-                        preview = ", ".join(fallback[:5]) + (" ..." if len(fallback) > 5 else "")
+                    existing = {name.lower() for name in target_names}
+                    if cfg.target_parent_folder:
+                        desired = [build_target_path(cfg, f["path"], delimiter)
+                                   for f in folders]
+                        missing = [path for path in desired
+                                   if imap_utf7_encode(path).lower() not in existing]
                         _report("Folder mapping", True,
-                                f"{len(folders) - len(fallback)}/{len(folders)} mapped, "
-                                f"{len(fallback)} fall back to INBOX ({preview})")
+                                f"tree under '{cfg.target_parent_folder}': "
+                                f"{len(desired) - len(missing)} exist, "
+                                f"{len(missing)} to create")
+                        if missing:
+                            preview = ", ".join(missing[:4]) + (" ..." if len(missing) > 4 else "")
+                            _report("  will create", True, preview)
                     else:
-                        _report("Folder mapping", True, f"all {len(folders)} folder(s) mapped")
+                        fallback = [
+                            f["path"] for f in folders
+                            if imap_utf7_encode(TARGET_FOLDER_MAP.get(f["displayName"], "INBOX"))
+                            .lower() not in existing
+                        ]
+                        if fallback:
+                            preview = ", ".join(fallback[:5]) + (" ..." if len(fallback) > 5 else "")
+                            _report("Folder mapping", True,
+                                    f"{len(folders) - len(fallback)}/{len(folders)} mapped, "
+                                    f"{len(fallback)} fall back to INBOX ({preview})")
+                        else:
+                            _report("Folder mapping", True,
+                                    f"all {len(folders)} folder(s) mapped")
             except Exception as e:
                 mailbox_ok = False
                 _report("IMAP folder listing", False, str(e))
@@ -755,11 +1140,11 @@ def dry_run(cfg, mailboxes):
         if not mailbox_ok:
             failures += 1
 
-    print("\n" + "=" * 78)
+    safe_print("\n" + "=" * 78)
     ready = len(mailboxes) - failures
-    print(f"Dry run finished: {ready}/{len(mailboxes)} mailbox(es) ready, "
-          f"{failures} with problems.")
-    print("No messages were written.")
+    safe_print(f"Dry run finished: {ready}/{len(mailboxes)} mailbox(es) ready, "
+               f"{failures} with problems.")
+    safe_print("No messages were written.")
     return 0 if failures == 0 else 1
 
 
@@ -774,16 +1159,33 @@ def parse_args(argv=None):
                         help=f"mailbox CSV file (default: {DEFAULT_CSV})")
     parser.add_argument("--env-file", metavar="PATH",
                         help=f"environment file (default: {DEFAULT_ENV})")
+    parser.add_argument("--target-parent-folder", metavar="PATH",
+                        help="migrate the source folder tree under this target folder "
+                             "(created if missing)")
+    parser.add_argument("--folders", metavar="LIST",
+                        help="comma-separated source folders or paths (subtree match)")
+    parser.add_argument("--limit", type=int, metavar="N",
+                        help="migrate at most N messages per mailbox (0 = all)")
     return parser.parse_args(argv)
 
 
 def main(argv=None):
+    global _active_board
+
     args = parse_args(argv)
 
     try:
         cfg = load_config(args.env_file)
         if args.csv:
             cfg.csv_file = args.csv
+        if args.target_parent_folder is not None:
+            cfg.target_parent_folder = normalize_parent_folder(args.target_parent_folder)
+        if args.folders is not None:
+            cfg.migrate_folders = parse_folder_list(args.folders)
+        if args.limit is not None:
+            if args.limit < 0:
+                raise MigrationError("--limit must be 0 or a positive integer")
+            cfg.migrate_limit = args.limit
         mailboxes = read_mailboxes_from_csv(cfg.csv_file)
     except MigrationError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -797,18 +1199,22 @@ def main(argv=None):
         if args.dry_run:
             return dry_run(cfg, mailboxes)
 
+        board = ProgressBoard()
+        _active_board = board
         threads = []
         for mailbox in mailboxes:
-            thread = threading.Thread(target=migrate_mailbox, args=(cfg, mailbox))
+            thread = threading.Thread(target=migrate_mailbox, args=(cfg, mailbox, board))
             threads.append(thread)
             thread.start()
 
         for thread in threads:
             thread.join()
+        _active_board = None
 
         print("All mailboxes have been migrated.")
         return 0
     except KeyboardInterrupt:
+        _active_board = None
         print("\nInterrupted.")
         return 130
 
