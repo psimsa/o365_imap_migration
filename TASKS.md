@@ -54,3 +54,15 @@ Remote: `origin` -> `git@github.com:psimsa/o365_imap_migration.git` (fork)
 - [ ] `INTERNALDATE` is migration time rather than `receivedDateTime`.
 - [ ] Original `Message-ID`/`Reply-To` headers are lost during re-rendering.
 - [ ] Optionally add `--no-progress` for very quiet logs.
+
+## Planned: interactive mode (`-i`)
+
+Spec: [docs/interactive-tui-spec.md](docs/interactive-tui-spec.md) (awaiting review)
+
+- [ ] Optional `--interactive` / `-i` wizard for a single mailbox.
+- [ ] Verify (and optionally persist) Graph credentials from `.env`.
+- [ ] Account statistics + migration plan preview.
+- [ ] Folder / message-limit scope selection.
+- [ ] IMAP credential validation and root-only parent-folder picker with fuzzy input.
+- [ ] Explicit confirmation, then run dry-run or migration; optional CSV row append.
+- [ ] Optional TUI dependencies (`requirements-tui.txt`), tests and docs.
