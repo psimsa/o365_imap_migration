@@ -12,10 +12,18 @@ Planned release: `1.1.0`. Everything below is on `feature/interactive-tui`
 
 ### Added
 
+- `--restartable` / `RESTARTABLE`: append-only per-mailbox session files under
+  `sessions/` record successfully migrated Graph message IDs; a rerun skips them
+  *before* `--limit` is applied, so interrupted migrations continue where they
+  stopped. `--reset-session` deletes a session; sessions are validated against the
+  source, target, server and parent folder, mode `0600`.
+- `--after` / `--before` (`MIGRATE_AFTER` / `MIGRATE_BEFORE`): server-side
+  `receivedDateTime` range filter, useful for backups ("older than ..."). Date-only
+  values are UTC midnight, `before` is exclusive; validated against each other.
 - **Draft interactive wizard** (`-i` / `--interactive`): single-mailbox flow that picks a
   mailbox from `details.csv` or asks for one, verifies Graph credentials from `.env`
   (hidden input, optional atomic write-back), shows account statistics, asks for folder
-  scope and a message limit, validates the IMAP login, offers a root-only target parent
+  scope, a message limit and a received-date range, validates the IMAP login, offers a root-only target parent
   folder (numbered menu under 10 folders, fuzzy typeahead otherwise, new names are
   created), then shows a read-only validation screen and the final plan. Confirmation
   defaults to **No** and no message is written before an explicit `yes`.

@@ -129,8 +129,12 @@ Two questions, defaults from CLI/env:
      Selecting a parent selects its subtree (same semantics as `--folders`).
 2. **Message limit**: `All messages` / `Newest N messages…` (positive integer; empty
    means all).
+3. **Received-date range** (optional): "Filter by received date?" then `after` and/or
+   `before` (`YYYY-MM-DD` or ISO-8601, UTC; empty means unbounded). The range is
+   validated (`after < before`).
 
-The effective values are stored in a copy of `Config` (`migrate_folders`, `migrate_limit`).
+The effective values are stored in a copy of `Config` (`migrate_folders`,
+`migrate_limit`, `migrate_after`, `migrate_before`).
 
 ### Step 5 — Target IMAP
 
@@ -192,6 +196,8 @@ Validation & plan
   Target          user@example.com      imap.example.com
   Folders         Inbox, Sent Items, Archive (+ subfolders)
   Limit           500 newest messages per folder selection
+  Time filter     after 2020-01-01T00:00:00Z, before 2023-01-01T00:00:00Z
+  Restartable     on (1 204 message(s) already migrated)
   Attachments     on            Body format   html
   Target parent   Migration 2026  (will be created)
 

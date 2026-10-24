@@ -54,6 +54,21 @@ Remote: `origin` -> `git@github.com:psimsa/o365_imap_migration.git` (fork)
   `/users/{userPrincipalName}/...` directly.
 - Conclusion: README requests `Mail.Read` only.
 
+## Restart + time filters (new)
+
+- [x] `--restartable` / `RESTARTABLE`: per-mailbox JSONL session of successfully
+      appended message IDs, skipped before `--limit`; header validates source, target,
+      server and parent folder; writes are flushed and fsynced periodically; mode `0600`.
+- [x] `--reset-session` / `RESET_SESSION` to delete the session and start over.
+- [x] `--after` / `--before` (`MIGRATE_AFTER` / `MIGRATE_BEFORE`) with server-side
+      `receivedDateTime` filtering, UTC normalization and range validation.
+- [x] Interactive wizard: date-filter prompts, restartable/resume row in the plan.
+- [x] Tests for date parsing/filtering, skip-before-limit paging, session round-trip,
+      mismatch detection, recording of successes and the interactive flow.
+- [x] Real-tenant check of the date filter: `before 2020-01-01`, `after 2025-01-01` and a
+      2020-2021 range all returned matching messages from `pavel@simsa.cz`.
+- [ ] Real-tenant trial of resume + a full filtered migration (needs IMAP credentials).
+
 ## Next / open questions
 
 - [ ] Run a real end-to-end trial (`--dry-run`, then `--limit 25`) and tag `1.1.0`.

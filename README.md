@@ -93,8 +93,8 @@ The wizard handles **one mailbox** per run:
 2. verify the Graph app credentials from `.env`, prompting (hidden input) if they are
    missing or rejected, with an optional, atomic write-back to `.env`;
 3. show account statistics (folders, message counts, sizes);
-4. choose all folders or a subset (a parent also selects its subfolders) and an optional
-   message limit;
+4. choose all folders or a subset (a parent also selects its subfolders), an optional
+   message limit and an optional received-date range;
 5. ask for the target IMAP credentials and verify the login with TLS;
 6. optionally mirror the folder tree under a root-level target folder: a numbered menu
    when the target has fewer than 10 root folders, otherwise a fuzzy typeahead input;
@@ -123,10 +123,14 @@ fuzzy completer. Feedback on the flow is welcome before it is finalised.
 | `--target-parent-folder PATH` | `TARGET_PARENT_FOLDER` | empty | Migrate the source folder tree below this target folder, creating missing folders (parents first). Empty = classic mapping |
 | `--folders LIST` | `MIGRATE_FOLDERS` | all | Comma-separated source folders or paths; a folder also selects its subtree |
 | `--limit N` | `MIGRATE_LIMIT` | `0` (all) | At most N messages per mailbox, newest first |
+| `--restartable` | `RESTARTABLE` | off | Record migrated message IDs per mailbox in `sessions/` and skip them when the run is repeated |
+| `--reset-session` | `RESET_SESSION` | off | Delete existing restart data before migrating (implies `--restartable`) |
+| `--after DATE` | `MIGRATE_AFTER` | no bound | Only messages received on/after DATE (`YYYY-MM-DD` or ISO-8601, UTC) |
+| `--before DATE` | `MIGRATE_BEFORE` | no bound | Only messages received before DATE (exclusive) |
 
 Other `.env` settings: `MIGRATE_ATTACHMENTS` (default **on**), `EMAIL_FORMAT`
-(`html` by default, or `plain`), `IMAP_SSL_VERIFY`, `GRAPH_PAGE_SIZE`, plus the three
-`SOURCE_*` credentials.
+(`html` by default, or `plain`), `IMAP_SSL_VERIFY`, `GRAPH_PAGE_SIZE`,
+`SESSION_DIR`, plus the three `SOURCE_*` credentials.
 
 ## Behaviour
 
@@ -144,6 +148,18 @@ Other `.env` settings: `MIGRATE_ATTACHMENTS` (default **on**), `EMAIL_FORMAT`
 - **Paging:** Graph returns 10 items per page by default. The script sets `$top`
   (`GRAPH_PAGE_SIZE`) and follows `@odata.nextLink` until every folder and
   message has been read; 429/5xx responses are retried honouring `Retry-After`.
+- **Time filter:** `--after`/`--before` are applied server-side with
+  `receivedDateTime ge/lt ...`, so the limit and paging work on the filtered set.
+  Date-only values are UTC midnight; `--before` is exclusive. This is useful for
+  backups such as "everything older than 2023-01-01".
+- **Restartable:** with `--restartable`, every successfully appended message ID is
+  written to `sessions/<source>__<target>__<server>__<hash>.jsonl` (one JSON object
+  per line, header validates source/target/parent folder, mode `0600`). A rerun
+  loads the file and skips those IDs *before* applying `--limit`, so you keep
+  making progress. Failed messages are not recorded. Use `--reset-session` to
+  deliberately start over (for example after changing the target parent folder);
+  a session that belongs to a different target is refused rather than mixed in.
+  Dry runs and the interactive validation step never write session data.
 - **Body format:** Graph only returns HTML bodies. `EMAIL_FORMAT=html` stores the
   HTML as-is; `EMAIL_FORMAT=plain` strips the markup. Some target servers do not
   render HTML well.
