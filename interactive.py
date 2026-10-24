@@ -307,6 +307,7 @@ class Plan:
     migrate_after: str = ""
     migrate_before: str = ""
     command: str = ""
+    verify_after: bool = True
 
 
 @dataclass
@@ -433,6 +434,7 @@ def build_plan(cfg, mailbox, folders, delimiter, existing_names, resume_count=0)
         resume_count=resume_count,
         migrate_after=cfg.migrate_after,
         migrate_before=cfg.migrate_before,
+        verify_after=cfg.verify_after_migration,
     )
 
 
@@ -443,6 +445,16 @@ def _describe_dates(plan):
     if plan.migrate_before:
         parts.append(f"before {plan.migrate_before}")
     return ", ".join(parts) or "none"
+
+
+def build_verify_command(env_file=None, csv_file=None):
+    """Non-interactive command that re-verifies recorded messages."""
+    parts = ["python", "o365_imap_migration.py", "--verify"]
+    if env_file and env_file != mig.DEFAULT_ENV:
+        parts += ["--env-file", env_file]
+    if csv_file and csv_file != mig.DEFAULT_CSV:
+        parts += ["--csv", csv_file]
+    return shlex.join(parts)
 
 
 def build_rerun_command(cfg, env_file=None):
@@ -492,6 +504,7 @@ def plan_rows(plan):
         ("Time filter", _describe_dates(plan)),
         ("Restartable", (f"on ({plan.resume_count} message(s) already migrated)"
                          if plan.restartable else "off")),
+        ("Verify after", "on" if plan.verify_after else "off"),
         ("Attachments", "on" if plan.attachments else "off"),
         ("Body format", plan.email_format),
         ("Target parent", parent),
@@ -957,6 +970,23 @@ class Wizard:
         self.renderer.info(f"Migration finished in {elapsed:.1f}s: "
                            f"{migrated} migrated, {failed} failed.")
 
+        if self.cfg.verify_after_migration and migrated > 0:
+            self.renderer.info(f"Verifying {migrated} migrated message(s) on the "
+                               f"target (re-reading them from "
+                               f"{self.mailbox.target_server})...")
+            mailbox = (self.mailbox.source_email, self.mailbox.target_server,
+                       self.mailbox.target_email, self.mailbox.password)
+            report = mig.verify_mailbox(self.cfg, mailbox)
+            for line in mig.format_verification(report):
+                self.renderer.info(line)
+            self.renderer.info(f"Re-verify anytime: "
+                               f"{build_verify_command(self.env_path, self.cfg.csv_file)}")
+            if not report.ok:
+                self.renderer.error("Verification found problems; see above.")
+                return 1
+            self.renderer.info("Verification finished: all migrated messages "
+                               "verified on the target.")
+
         self.renderer.info(f"Restart command: {self.rerun_command()}")
         return 0 if failed == 0 else 1
 
@@ -1083,6 +1113,9 @@ def run_interactive(args, prompter=None, renderer=None):
     if getattr(args, "dry_run", False):
         renderer.info("Note: interactive mode always validates before migrating, "
                       "so --dry-run is ignored here.")
+    if getattr(args, "verify", False):
+        renderer.info("Note: interactive mode verifies automatically after "
+                      "migrating, so --verify is ignored here.")
 
     wizard = Wizard(cfg, prompter, renderer, args.env_file or mig.DEFAULT_ENV)
     try:

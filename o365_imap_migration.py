@@ -26,10 +26,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from email import encoders, message_from_string
+from email import encoders, message_from_bytes, message_from_string
 from email.mime.base import MIMEBase
 from email.mime.message import MIMEMessage
 from email.mime.multipart import MIMEMultipart
+from email.header import decode_header, make_header
 from email.mime.text import MIMEText
 from email.utils import format_datetime, parsedate_to_datetime
 from typing import Optional
@@ -55,6 +56,9 @@ REQUIRED_ENV = ["SOURCE_CLIENT_ID", "SOURCE_CLIENT_SECRET", "SOURCE_TENANT_ID"]
 TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 ATTACHMENT_EXPAND = "microsoft.graph.itemAttachment/item"
+# Charset declarations inside HTML bodies (rewritten to UTF-8 on conversion).
+META_CHARSET_RE = re.compile(r'(<meta\b[^>]*?\bcharset\s*=\s*["\']?)[^"\'>\s;]+')
+XML_ENCODING_RE = re.compile(r'(<\?xml\b[^>]*?\bencoding\s*=\s*["\'])[^"\']+(["\'])')
 
 # Fallback mapping for the default folders; anything unmapped goes to INBOX.
 TARGET_FOLDER_MAP = {
@@ -77,6 +81,10 @@ class GraphError(Exception):
 # Printing and progress ------------------------------------------------------
 
 print_lock = threading.Lock()
+# One mailbox's token cache lives in tokens/token_<email>/; serialise
+# authentication so two threads migrating the same source cannot delete each
+# other's token directory mid-flight.
+auth_lock = threading.Lock()
 _active_board: Optional["ProgressBoard"] = None
 
 
@@ -264,6 +272,7 @@ class Config:
     restartable: bool = False
     reset_session: bool = False
     session_dir: str = SESSIONS_DIR
+    verify_after_migration: bool = True
 
 
 def env_bool(name, default=False):
@@ -382,6 +391,7 @@ def load_config(env_file=None, require_credentials=True):
         restartable=env_bool("RESTARTABLE", False),
         reset_session=env_bool("RESET_SESSION", False),
         session_dir=(os.getenv("SESSION_DIR") or SESSIONS_DIR).strip(),
+        verify_after_migration=env_bool("VERIFY_AFTER_MIGRATION", True),
     )
 
 
@@ -458,6 +468,7 @@ class MigrationSession:
         self.server = server
         self.parent_folder = parent_folder
         self.ids = set()
+        self.entries = []  # full records, in write order (for verification)
         self.written = 0
         self._handle = None
         self._since_sync = 0
@@ -486,6 +497,7 @@ class MigrationSession:
                     continue
                 if entry.get("id"):
                     session.ids.add(str(entry["id"]))
+                    session.entries.append(entry)
 
         if header is None:
             # A file without a valid header (older version, partial write) can
@@ -512,6 +524,7 @@ class MigrationSession:
         if os.path.exists(self.path):
             os.remove(self.path)
         self.ids.clear()
+        self.entries.clear()
         self.written = 0
         return self
 
@@ -523,15 +536,32 @@ class MigrationSession:
     def contains(self, message_id):
         return str(message_id) in self.ids
 
-    def record(self, message_id, folder=""):
+    def record(self, message_id, folder="", uid=None, uidvalidity=None,
+               sha256=None, subject=None):
+        """Records one successfully appended message.
+
+        ``uid``/``uidvalidity`` come from the APPENDUID response (UIDPLUS) and
+        ``sha256`` is the hash of the appended bytes (line endings normalized),
+        which lets --verify prove the message arrived intact. ``subject`` is the
+        exact subject written to the header, for decode checks.
+        """
         message_id = str(message_id)
         if message_id in self.ids:
             return
         self._ensure_open()
         entry = {"id": message_id, "folder": folder, "ts": utcnow_iso()}
+        if uid is not None:
+            entry["uid"] = str(uid)
+        if uidvalidity is not None:
+            entry["uidvalidity"] = str(uidvalidity)
+        if sha256 is not None:
+            entry["sha256"] = sha256
+        if subject is not None:
+            entry["subject"] = subject
         self._handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
         self._handle.flush()
         self.ids.add(message_id)
+        self.entries.append(entry)
         self.written += 1
         self._since_sync += 1
         if self._since_sync >= 32:
@@ -797,9 +827,28 @@ def fetch_all_emails(cfg, source_email, access_token, skip_ids=None):
 
 # Message conversion ---------------------------------------------------------
 
+def message_subject(msg):
+    """The subject exactly as it is written into the outgoing header."""
+    return msg.get("subject") or "(No Subject)"
+
+
+def normalize_html_charset(body):
+    """Rewrites charset declarations inside an HTML body to UTF-8.
+
+    Graph returns bodies as decoded Unicode, but the embedded
+    ``<meta charset=...>`` / XML declaration may still claim windows-1252 or
+    another legacy encoding, which would make mail clients mis-decode the
+    UTF-8 bytes we write.
+    """
+    body = META_CHARSET_RE.sub(r"\1utf-8", body)
+    body = XML_ENCODING_RE.sub(r"\1utf-8\2", body)
+    return body
+
+
 def extract_email_body(msg, email_format="html"):
     """Extract the body; strip markup only when the target expects plain text."""
-    body = (msg.get("body") or {}).get("content") or ""
+    body_info = msg.get("body") or {}
+    body = body_info.get("content") or ""
     if not body:
         return "(No Body)"
 
@@ -807,6 +856,8 @@ def extract_email_body(msg, email_format="html"):
         body = re.sub(r"<[^>]+>", "", body)
         body = re.sub(r"\s+", " ", body)
         body = html.unescape(body)
+    elif body_info.get("contentType") == "html":
+        body = normalize_html_charset(body)
 
     return body.strip() or "(No Body)"
 
@@ -840,7 +891,7 @@ def attachment_filename(name, default="attachment", forced_suffix=None):
 def convert_to_rfc822(cfg, msg):
     """Converts a Graph message dictionary to RFC822 format."""
     try:
-        subject = msg.get("subject") or "(No Subject)"
+        subject = message_subject(msg)
         sender = ((msg.get("from") or {}).get("emailAddress") or {}).get("address")
         sender = sender or "unknown@example.com"
 
@@ -1002,6 +1053,12 @@ def connect_to_target_imap(cfg, server, email_user, password=None, timeout=30):
         mail = imaplib.IMAP4_SSL(server, timeout=timeout, ssl_context=context)
         mail.login(email_user, password)
         mail.noop()
+        try:
+            # UIDPLUS gives APPENDUID in APPEND responses, which the restart
+            # session uses to verify messages on the target later.
+            mail.enable("UIDPLUS")
+        except Exception:
+            pass  # no UIDPLUS: sessions record hashes but verification is limited
     except ssl.SSLError as e:
         safe_print(f"TLS error connecting to {server}: {e}")
         return None
@@ -1079,14 +1136,22 @@ def imap_quote(name):
 
 
 def sanitize_folder_component(name):
-    name = re.sub(r"[\x00-\x1f\x7f]", "", str(name)).strip()
+    # Drop control characters, quotes and backslashes: they are illegal or
+    # ambiguous in IMAP mailbox names once UTF-7 encoded.
+    name = re.sub(r'[\x00-\x1f\x7f"\\]', "", str(name)).strip()
     if name in ("", ".", ".."):
         return "Unnamed"
     return name[:100]
 
 
 def build_target_path(cfg, source_path, delimiter):
-    """Target mailbox path for a source folder path (unencoded)."""
+    """Target mailbox path for a source folder path (unencoded).
+
+    The source path is split on "/" (Graph folder paths are built that way), so
+    a display name that itself contains "/" arrives as multiple components. Each
+    component is sanitized and the *server's* delimiter is neutralized inside
+    components so a name can never accidentally nest on the target.
+    """
     parent = [sanitize_folder_component(part)
               for part in cfg.target_parent_folder.split("/") if part.strip()]
     parts = [sanitize_folder_component(part)
@@ -1095,8 +1160,8 @@ def build_target_path(cfg, source_path, delimiter):
         parts = ["Inbox"]
 
     components = parent + parts
-    if delimiter != "/":
-        # A name containing the delimiter would accidentally nest on the target.
+    if delimiter and delimiter != "/":
+        # A component containing the delimiter would accidentally nest.
         components = [part.replace(delimiter, "_") for part in components]
     return delimiter.join(components)
 
@@ -1143,19 +1208,46 @@ def ensure_target_folder(mail, path, delimiter, state):
 
 
 def default_target_folder(display_name, state, warned):
-    """Maps a standard Outlook folder to the target, falling back to INBOX."""
+    """Maps a standard Outlook folder to the target (unencoded), else INBOX."""
     candidate = TARGET_FOLDER_MAP.get(display_name, "INBOX")
-    wire_name = imap_utf7_encode(candidate)
-    if wire_name.lower() not in state["existing"]:
+    if imap_utf7_encode(candidate).lower() not in state["existing"]:
         if candidate.upper() != "INBOX" and display_name not in warned:
             warned.add(display_name)
             safe_print(f"Target folder '{candidate}' does not exist; "
                        f"'{display_name}' falls back to INBOX")
-        wire_name = imap_utf7_encode("INBOX")
-    return wire_name
+        candidate = "INBOX"
+    return candidate
+
+
+@dataclass
+class AppendResult:
+    """Outcome of appending one message."""
+    ok: bool
+    display_folder: str = ""
+    target_path: str = ""
+    uid: Optional[str] = None
+    uidvalidity: Optional[str] = None
+    sha256: Optional[str] = None
+
+
+def normalize_message_bytes(data):
+    """Normalizes a raw RFC822 message for hashing (LF endings, no trailing NL)."""
+    return data.replace(b"\r\n", b"\n").rstrip(b"\n")
+
+
+def _parse_append_uid(response):
+    """Parses the APPENDUID response code (UIDPLUS): returns (uidvalidity, uid)."""
+    for item in response or []:
+        text = (item.decode("ascii", "replace") if isinstance(item, (bytes, bytearray))
+                else str(item))
+        parts = text.split()
+        if len(parts) >= 3 and parts[0] == "APPENDUID":
+            return parts[1], parts[2]
+    return None, None
 
 
 def _append_with_retries(mail, wire_folder, payload, attempts=3):
+    """APPENDs one message; returns (ok, uid, uidvalidity)."""
     for attempt in range(1, attempts + 1):
         try:
             status, response = mail.append(
@@ -1165,18 +1257,19 @@ def _append_with_retries(mail, wire_folder, payload, attempts=3):
         except (OSError, imaplib.IMAP4.abort) as e:
             if attempt == attempts:
                 safe_print(f"Append failed after {attempts} attempts: {e}")
-                return False
+                return False, None, None
             time.sleep(2)
             continue
         except Exception as e:
             safe_print(f"Append failed: {e}")
-            return False
+            return False, None, None
 
         if status == "OK":
-            return True
+            uidvalidity, uid = _parse_append_uid(response)
+            return True, uid, uidvalidity
         safe_print(f"Append to '{wire_folder}' failed: {response}")
-        return False
-    return False
+        return False, None, None
+    return False, None, None
 
 
 def prepare_target_state(target_mail):
@@ -1190,34 +1283,37 @@ def prepare_target_state(target_mail):
 
 
 def migrate_one(cfg, target_mail, msg, state, warned):
-    """Converts and appends a single message. Returns (ok, display_folder)."""
+    """Converts and appends a single message; returns an AppendResult."""
     if not isinstance(msg, dict):
         safe_print(f"Unexpected message format: {msg!r}")
-        return False, ""
+        return AppendResult(False)
 
-    display_folder = ""
     try:
         source_path = msg.get("folderPath") or msg.get("folderName") or "Inbox"
 
         if cfg.target_parent_folder:
             target_path = build_target_path(cfg, source_path, state["delimiter"])
-            wire_folder = ensure_target_folder(target_mail, target_path,
-                                               state["delimiter"], state)
+            ensure_target_folder(target_mail, target_path, state["delimiter"], state)
             display_folder = target_path
         else:
             display_folder = msg.get("folderName") or "Inbox"
-            wire_folder = default_target_folder(display_folder, state, warned)
+            target_path = default_target_folder(display_folder, state, warned)
 
         email_message = convert_to_rfc822(cfg, msg)
         if not isinstance(email_message, str):
             safe_print(f"Email conversion failed for message: {msg.get('id')}")
-            return False, display_folder
+            return AppendResult(False, display_folder, target_path)
 
-        return _append_with_retries(
-            target_mail, wire_folder, email_message.encode("utf-8")), display_folder
+        # IMAP messages are CRLF-delimited; convert_to_rfc822 emits LF only.
+        payload = email_message.encode("utf-8").replace(b"\n", b"\r\n")
+        ok, uid, uidvalidity = _append_with_retries(target_mail, imap_utf7_encode(target_path),
+                                                    payload)
+        sha256 = (hashlib.sha256(normalize_message_bytes(payload)).hexdigest()
+                  if ok else None)
+        return AppendResult(ok, display_folder, target_path, uid, uidvalidity, sha256)
     except Exception as e:
         safe_print(f"Error migrating email: {e}")
-        return False, display_folder
+        return AppendResult(False)
 
 
 def migrate_emails(cfg, target_mail, messages, board=None, key=None, session=None):
@@ -1227,21 +1323,23 @@ def migrate_emails(cfg, target_mail, messages, board=None, key=None, session=Non
     current_folder = None
 
     for msg in messages:
-        ok, display_folder = migrate_one(cfg, target_mail, msg, state, warned)
+        result = migrate_one(cfg, target_mail, msg, state, warned)
 
-        if (board is not None and key is not None and display_folder
-                and display_folder != current_folder):
-            current_folder = display_folder
-            board.set_folder(key, display_folder)
+        if (board is not None and key is not None and result.display_folder
+                and result.display_folder != current_folder):
+            current_folder = result.display_folder
+            board.set_folder(key, result.display_folder)
 
-        if ok:
+        if result.ok:
             migrated += 1
             if session is not None:
-                session.record(msg.get("id"), display_folder)
+                session.record(msg.get("id"), folder=result.target_path,
+                               uid=result.uid, uidvalidity=result.uidvalidity,
+                               sha256=result.sha256, subject=message_subject(msg))
         else:
             failed += 1
         if board is not None and key is not None:
-            board.advance(key, ok)
+            board.advance(key, result.ok)
 
     return migrated, failed
 
@@ -1329,6 +1427,174 @@ def migrate_mailbox(cfg, mailbox, board=None):
     finally:
         if session is not None:
             session.close()
+
+
+# Verification ---------------------------------------------------------------
+
+@dataclass
+class VerificationReport:
+    """Result of verifying a mailbox's restart session against the target."""
+    total: int = 0
+    verified: int = 0
+    missing: int = 0
+    mismatched: int = 0
+    unverifiable: int = 0
+    subject_mismatches: int = 0
+    folders: dict = field(default_factory=dict)  # folder -> [checked, ok, missing, bad, skip]
+    problems: list = field(default_factory=list)
+
+    @property
+    def ok(self):
+        return (self.missing == 0 and self.mismatched == 0
+                and self.subject_mismatches == 0)
+
+    def _folder_counts(self, folder):
+        return self.folders.setdefault(folder, [0, 0, 0, 0, 0])
+
+
+def _extract_fetch_body(data):
+    """Extracts raw message bytes from a UID FETCH ``BODY[]`` response."""
+    for item in data or []:
+        if (isinstance(item, tuple) and len(item) == 2
+                and isinstance(item[1], (bytes, bytearray))):
+            return bytes(item[1])
+    return None
+
+
+def _decoded_subject(raw_message):
+    """Decodes an RFC 2047 subject header back to a Unicode string."""
+    try:
+        return str(make_header(decode_header(raw_message.get("Subject", ""))))
+    except Exception:
+        return None
+
+
+def verify_mailbox(cfg, mailbox):
+    """Verifies messages recorded in the restart session against the target.
+
+    For every session entry with a recorded UID and content hash, the message
+    is fetched back from the target IMAP server (read-only, BODY.PEEK) and:
+
+    - the SHA-256 of the fetched bytes (line endings normalized) must match the
+      hash of the bytes that were appended - this catches any byte-level
+      corruption, including mangled Unicode;
+    - the Subject header must decode back to the exact original subject -
+      this catches RFC 2047 encoding mistakes specifically.
+
+    Entries recorded before UID/hash tracking (or after a UIDVALIDITY change)
+    are counted as unverifiable, not as failures.
+    """
+    source_email, target_server, target_email, target_password = mailbox
+    report = VerificationReport()
+
+    session = MigrationSession.load(cfg, mailbox)
+    if not session.entries:
+        return report
+
+    mail = connect_to_target_imap(cfg, target_server, target_email, target_password)
+    if mail is None:
+        report.problems.append(f"could not connect to {target_server}")
+        return report
+
+    try:
+        delimiter, _ = get_imap_hierarchy(mail)
+        current_wire = None
+        current_uidvalidity = None
+
+        for entry in session.entries:
+            report.total += 1
+            folder = entry.get("folder") or "INBOX"
+            counts = report._folder_counts(folder)
+            counts[0] += 1
+
+            wire_folder = imap_utf7_encode(folder)
+            if wire_folder != current_wire:
+                status, _ = mail.select(imap_quote(wire_folder), readonly=True)
+                if status != "OK":
+                    report.problems.append(f"folder {folder!r} is not selectable "
+                                           f"on the target")
+                typ, data = mail.response("UIDVALIDITY")
+                current_uidvalidity = (data[0].decode("ascii", "replace")
+                                       if data and data[0] else None)
+                current_wire = wire_folder
+
+            uid = entry.get("uid")
+            sha256 = entry.get("sha256")
+            if not uid or not sha256:
+                report.unverifiable += 1
+                counts[4] += 1
+                continue
+
+            uidvalidity = entry.get("uidvalidity")
+            if (uidvalidity and current_uidvalidity
+                    and str(uidvalidity) != str(current_uidvalidity)):
+                report.unverifiable += 1
+                counts[4] += 1
+                report.problems.append(
+                    f"{entry.get('id')}: UIDVALIDITY changed "
+                    f"({uidvalidity} -> {current_uidvalidity}); cannot verify by UID")
+                continue
+
+            try:
+                typ, data = mail.uid("FETCH", str(uid), "(BODY.PEEK[])")
+            except Exception as e:
+                report.missing += 1
+                counts[2] += 1
+                report.problems.append(f"{entry.get('id')}: FETCH failed in "
+                                       f"{folder!r}: {e}")
+                continue
+
+            payload = _extract_fetch_body(data)
+            if payload is None:
+                report.missing += 1
+                counts[2] += 1
+                report.problems.append(f"{entry.get('id')}: not found in {folder!r}")
+                continue
+
+            if hashlib.sha256(normalize_message_bytes(payload)).hexdigest() != sha256:
+                report.mismatched += 1
+                counts[3] += 1
+                report.problems.append(f"{entry.get('id')}: content mismatch in "
+                                       f"{folder!r}")
+                continue
+
+            expected_subject = entry.get("subject")
+            if expected_subject is not None:
+                actual_subject = _decoded_subject(message_from_bytes(payload))
+                if (actual_subject is None
+                        or actual_subject.strip() != expected_subject.strip()):
+                    report.subject_mismatches += 1
+                    counts[3] += 1
+                    report.problems.append(
+                        f"{entry.get('id')}: subject mismatch in {folder!r}: "
+                        f"{actual_subject!r} != {expected_subject!r}")
+                    continue
+
+            report.verified += 1
+            counts[1] += 1
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+
+    return report
+
+
+def format_verification(report):
+    """Human-readable summary lines for a VerificationReport."""
+    lines = [f"  entries: {report.total} (verified {report.verified}, "
+             f"missing {report.missing}, mismatched {report.mismatched}, "
+             f"not verifiable {report.unverifiable}, "
+             f"subject decode mismatches {report.subject_mismatches})"]
+    for folder, (checked, ok, missing, bad, skipped) in report.folders.items():
+        lines.append(f"  folder {folder}: {checked} checked, {ok} ok, "
+                     f"{missing} missing, {bad} mismatched, {skipped} not verifiable")
+    for problem in report.problems[:20]:
+        lines.append(f"  PROBLEM: {problem}")
+    if len(report.problems) > 20:
+        lines.append(f"  ... {len(report.problems) - 20} more problem(s)")
+    return lines
 
 
 # Dry run --------------------------------------------------------------------
@@ -1523,6 +1789,9 @@ def parse_args(argv=None):
     parser.add_argument("--reset-session", action="store_true",
                         help="delete existing restart data before migrating (implies "
                              "--restartable)")
+    parser.add_argument("--verify", action="store_true",
+                        help="verify messages recorded in restart sessions against the "
+                             "target (no migration)")
     parser.add_argument("--after", metavar="DATE",
                         help="only messages received on/after DATE "
                              "(YYYY-MM-DD or ISO-8601, UTC)")
@@ -1573,6 +1842,29 @@ def main(argv=None):
         return 2
 
     try:
+        if args.verify:
+            if args.dry_run:
+                print("Note: --dry-run has no effect in --verify mode.")
+            failures = 0
+            for mailbox in mailboxes:
+                print(f"Verifying {mailbox[0]} -> {mailbox[2]} @ {mailbox[1]}")
+                report = verify_mailbox(cfg, mailbox)
+                if report.total == 0:
+                    print("  no restart session entries; nothing to verify "
+                          "(migrate with --restartable first)")
+                    failures += 1
+                    continue
+                for line in format_verification(report):
+                    print(line)
+                if not report.ok:
+                    failures += 1
+            if failures:
+                print(f"Verification finished with problems in {failures} of "
+                      f"{len(mailboxes)} mailbox(es).")
+                return 1
+            print("Verification finished: all recorded messages verified.")
+            return 0
+
         if args.dry_run:
             return dry_run(cfg, mailboxes)
 

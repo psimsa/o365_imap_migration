@@ -309,6 +309,59 @@ class FlowTests(unittest.TestCase):
         self.assertTrue(any("Restart command" in line and "--restartable" in line
                             for line in self.renderer.lines))
 
+    def test_verification_runs_after_migration(self):
+        self._patch_world()
+        mig.migrate_mailbox.return_value = (2, 0)
+        report = mig.VerificationReport(total=2, verified=2)
+        with mock.patch.object(mig, "verify_mailbox", return_value=report) as verify:
+            answers = self._answers() + [True]
+            rc = tui.run_interactive(self.args, tui.ScriptedPrompter(answers),
+                                     self.renderer)
+        self.assertEqual(rc, 0, self.renderer.lines)
+        self.assertEqual(verify.call_count, 1)
+        self.assertTrue(any("Verification finished: all migrated messages verified"
+                            in line for line in self.renderer.lines))
+        self.assertTrue(any("--verify" in line for line in self.renderer.lines))
+        self.assertTrue(any("Verify after" in line for line in self.renderer.lines))
+
+    def test_verification_failure_exits_1(self):
+        self._patch_world()
+        mig.migrate_mailbox.return_value = (2, 0)
+        report = mig.VerificationReport(total=2, verified=1, missing=1,
+                                        problems=["m1: not found"])
+        with mock.patch.object(mig, "verify_mailbox", return_value=report):
+            answers = self._answers() + [True]
+            rc = tui.run_interactive(self.args, tui.ScriptedPrompter(answers),
+                                     self.renderer)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("Verification found problems" in line
+                            for line in self.renderer.lines))
+
+    def test_verification_can_be_disabled(self):
+        self.cfg = support.make_cfg(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+            csv_file=os.path.join(self.tmp.name, "details.csv"),
+            verify_after_migration=False)
+        self._patch_world()
+        mig.migrate_mailbox.return_value = (2, 0)
+        with mock.patch.object(mig, "verify_mailbox") as verify:
+            answers = self._answers() + [True]
+            rc = tui.run_interactive(self.args, tui.ScriptedPrompter(answers),
+                                     self.renderer)
+        self.assertEqual(rc, 0)
+        self.assertEqual(verify.call_count, 0)
+        self.assertTrue(any("Verify after" in line and "off" in line
+                            for line in self.renderer.lines))
+
+    def test_verify_flag_is_ignored_with_note(self):
+        self._patch_world()
+        with mock.patch.object(tui.Wizard, "run", return_value=0):
+            args = mig.parse_args(["-i", "--verify"])
+            rc = tui.run_interactive(args, tui.ScriptedPrompter([]), self.renderer)
+        self.assertEqual(rc, 0)
+        self.assertTrue(any("--verify is ignored" in line
+                            for line in self.renderer.lines))
+
     def test_resume_prompt_offers_existing_session(self):
         self.cfg = support.make_cfg(
             client_id="id", client_secret="secret", tenant_id="tenant",

@@ -85,6 +85,7 @@ class FakeRequests:
         pass
 
     calls = []
+    message_pages = None  # optional override: list of pages (lists of messages)
 
     @classmethod
     def get(cls, url, headers=None, params=None, timeout=None):
@@ -111,6 +112,18 @@ class FakeRequests:
         if "/messages" in url:
             if params.get("$top") == 1:
                 return FakeResponse({"value": [message(1)]})
+            if cls.message_pages is not None:
+                # Deterministic per-folder message lists (for verification tests).
+                folder_id = url.rsplit("/mailFolders/", 1)[1].split("/")[0]
+                pages = cls.message_pages.get(folder_id, [[message(1)]])
+                index = min(len(cls.calls) and sum(
+                    1 for u, _ in cls.calls
+                    if u == url and _ is not None) or 0, len(pages) - 1)
+                page = pages[index]
+                response = {"value": page}
+                if index < len(pages) - 1:
+                    response["@odata.nextLink"] = f"https://graph.test/next/{folder_id}"
+                return FakeResponse(response)
             if url == "https://graph.test/next/messages":
                 return FakeResponse({"value": [message(3)]})
             return FakeResponse({"value": [message(1), message(2)],
@@ -119,14 +132,21 @@ class FakeRequests:
 
 
 class FakeIMAP:
+    """IMAP fake with UIDPLUS: APPEND returns APPENDUID and stores CRLF bytes."""
+
     instances = []
     fail_login = False
+    capabilities = ("IMAP4rev1", "UIDPLUS")
+    uidvalidity = 1
 
     def __init__(self, host="", port=None, *, ssl_context=None, timeout=None):
         self.host = host
         self.ssl_context = ssl_context
-        self.appended = []
+        self.appended = []      # (folder, payload as sent)
         self.created = []
+        self._stored = {}       # (folder, uid) -> payload with CRLF endings
+        self._next_uid = 1
+        self._selected = None
         FakeIMAP.instances.append(self)
 
     def login(self, user, password):
@@ -136,6 +156,9 @@ class FakeIMAP:
 
     def noop(self):
         return ("OK", [b""])
+
+    def enable(self, *capabilities):
+        return ("OK", [b" ".join(c.encode() for c in capabilities)])
 
     def list(self):
         return ("OK", [b'(\\HasNoChildren) "/" "INBOX"',
@@ -151,8 +174,35 @@ class FakeIMAP:
 
     def append(self, mailbox, flags, when, msg):
         unquoted = mailbox[1:-1] if mailbox.startswith('"') else mailbox
+        uid = str(self._next_uid)
+        self._next_uid += 1
+        # The migration already sends CRLF; a real server may additionally
+        # normalize (e.g. add a trailing CRLF), which normalize_message_bytes
+        # tolerates. Store as-is to model that.
+        self._stored[(unquoted, uid)] = msg
         self.appended.append((unquoted, msg))
-        return ("OK", [b""])
+        return ("OK", [f"APPENDUID {self.uidvalidity} {uid}".encode()])
+
+    def select(self, mailbox="INBOX", readonly=False):
+        unquoted = mailbox[1:-1] if mailbox.startswith('"') else mailbox
+        self._selected = unquoted
+        count = sum(1 for folder, _ in self._stored if folder == unquoted)
+        return ("OK", [str(count).encode()])
+
+    def response(self, key):
+        if key == "UIDVALIDITY":
+            return ("OK", [str(self.uidvalidity).encode()])
+        return ("OK", [None])
+
+    def uid(self, command, *args):
+        if command != "FETCH":
+            raise mig.imaplib.IMAP4.error(f"unsupported UID command {command}")
+        uid = str(args[0])
+        payload = self._stored.get((self._selected, uid))
+        if payload is None:
+            return ("OK", [b""])
+        header = f"{uid} (UID {uid} BODY[] {{{len(payload)}}}".encode()
+        return ("OK", [(header, payload), b")"])
 
     def logout(self):
         return ("BYE", [b""])
@@ -170,6 +220,7 @@ class FakeImaplib:
 
 def install_fakes():
     FakeRequests.calls = []
+    FakeRequests.message_pages = None
     FakeIMAP.instances = []
     FakeIMAP.fail_login = False
     mig.requests = FakeRequests
@@ -190,6 +241,7 @@ def make_cfg(**overrides):
         target_parent_folder="",
         migrate_folders=[],
         migrate_limit=0,
+        verify_after_migration=True,
     )
     base.update(overrides)
     return mig.Config(**base)
