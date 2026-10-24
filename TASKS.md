@@ -62,7 +62,8 @@ Remote: `origin` -> `git@github.com:psimsa/o365_imap_migration.git` (fork)
 - [x] `--reset-session` / `RESET_SESSION` to delete the session and start over.
 - [x] `--after` / `--before` (`MIGRATE_AFTER` / `MIGRATE_BEFORE`) with server-side
       `receivedDateTime` filtering, UTC normalization and range validation.
-- [x] Interactive wizard: date-filter prompts, restartable/resume row in the plan.
+- [x] Interactive wizard: date-filter prompts and a resume prompt (uses or deletes an
+      existing session, defaults on when one exists), plus resume/time-filter rows in the plan.
 - [x] Tests for date parsing/filtering, skip-before-limit paging, session round-trip,
       mismatch detection, recording of successes and the interactive flow.
 - [x] Real-tenant check of the date filter: `before 2020-01-01`, `after 2025-01-01` and a

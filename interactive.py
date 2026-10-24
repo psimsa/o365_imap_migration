@@ -751,6 +751,55 @@ class Wizard:
         self.renderer.info(f"Parent folder: {chosen} "
                            f"({'existing' if matched else 'will be created'})")
 
+    def step_resume(self):
+        self.renderer.step(7, 8, "Resume & validation")
+        mailbox = (self.mailbox.source_email, self.mailbox.target_server,
+                   self.mailbox.target_email, self.mailbox.password)
+
+        if self.cfg.reset_session:
+            self.renderer.info("Existing restart data will be deleted (--reset-session).")
+            self.cfg = replace(self.cfg, restartable=True)
+            return
+
+        existing = 0
+        try:
+            session = mig.MigrationSession.load(self.cfg, mailbox)
+            existing = len(session.ids)
+            session.close()
+        except mig.MigrationError as exc:
+            self.renderer.warn(str(exc))
+            if not self.prompter.confirm(
+                    "Delete the incompatible restart data and start over?", default=False):
+                self.cfg = replace(self.cfg, restartable=False, reset_session=False)
+                return
+            mig.MigrationSession(mig.session_path(self.cfg, mailbox), mailbox[0],
+                                 mailbox[2], mailbox[1],
+                                 self.cfg.target_parent_folder).reset()
+            existing = 0
+
+        default = self.cfg.restartable or existing > 0
+        if not self.prompter.confirm("Resume if the migration is interrupted?",
+                                     default=default):
+            self.cfg = replace(self.cfg, restartable=False, reset_session=False)
+            if existing:
+                self.renderer.warn("Existing restart data will be ignored "
+                                   "(not deleted).")
+            return
+
+        self.cfg = replace(self.cfg, restartable=True, reset_session=False)
+        if existing:
+            self.renderer.info(f"{existing} message(s) already migrated in "
+                               f"{session.path}.")
+            if self.prompter.confirm("Delete this restart data and start over?",
+                                     default=False):
+                mig.MigrationSession(mig.session_path(self.cfg, mailbox), mailbox[0],
+                                     mailbox[2], mailbox[1],
+                                     self.cfg.target_parent_folder).reset()
+                self.cfg = replace(self.cfg, reset_session=True)
+                self.renderer.info("Restart data will be deleted before migrating.")
+        else:
+            self.renderer.info("Progress will be recorded so a rerun can resume.")
+
     # -- validation and plan ----------------------------------------------
 
     def _sample_check(self):
@@ -885,6 +934,7 @@ class Wizard:
         self.step_stats()
         self.step_imap()
         self.step_parent()
+        self.step_resume()
 
         while True:
             self.step_scope()

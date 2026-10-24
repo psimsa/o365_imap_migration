@@ -167,7 +167,13 @@ Question: `Mirror the folder tree under an existing/new target folder?`
     plan says `reuse existing`. Otherwise → `will be created`.
 - Either way the choice is stored in `cfg.target_parent_folder`.
 
-### Step 7 — Validation, final plan and confirmation
+### Step 7 — Resume, validation, final plan and confirmation
+
+Before validating, the wizard asks whether to record progress so an interrupted run can
+resume (`restartable`). The default is **on** when a session file already exists for the
+chosen source/target/parent folder. An existing session is reported with its recorded
+message count and can be kept (resume) or deleted (start over); an incompatible session
+(wrong target/parent) offers to be deleted or disables restart for this run.
 
 This step replaces a separate dry-run action. It performs the read-only checks the
 migration depends on (without fetching or writing the mailbox) and shows the resulting

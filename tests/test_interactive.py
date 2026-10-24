@@ -189,6 +189,7 @@ class FlowTests(unittest.TestCase):
             "pw",                 # IMAP password
             False,                # save row to CSV
             False,                # mirror under parent folder
+            False,                # do not resume an interrupted migration
             0,                    # all folders
             False,                # no message limit
             False,                # no received-date filter
@@ -215,10 +216,12 @@ class FlowTests(unittest.TestCase):
                             for line in self.renderer.lines))
         self.assertTrue(any("Time filter" in line for line in self.renderer.lines))
         self.assertTrue(any("Restartable" in line for line in self.renderer.lines))
+        cfg_used = mig.migrate_mailbox.call_args.args[0]
+        self.assertFalse(cfg_used.restartable)
 
     def test_date_filter_is_applied(self):
         self._patch_world()
-        answers = self._answers()[:8] + [True, "2020-01-01", "2021-01-01", True]
+        answers = self._answers()[:-1] + [True, "2020-01-01", "2021-01-01", True]
         prompter = tui.ScriptedPrompter(answers)
         rc = tui.run_interactive(self.args, prompter, self.renderer)
         self.assertEqual(rc, 0, self.renderer.lines)
@@ -226,6 +229,43 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(cfg_used.migrate_after, "2020-01-01T00:00:00Z")
         self.assertEqual(cfg_used.migrate_before, "2021-01-01T00:00:00Z")
         self.assertTrue(any("after 2020-01-01" in line
+                            for line in self.renderer.lines))
+
+    def test_resume_prompt_enables_restartable(self):
+        self._patch_world()
+        answers = list(self._answers())
+        answers[6] = True  # resume if interrupted
+        answers.append(True)  # start
+        prompter = tui.ScriptedPrompter(answers)
+        rc = tui.run_interactive(self.args, prompter, self.renderer)
+        self.assertEqual(rc, 0, self.renderer.lines)
+        cfg_used = mig.migrate_mailbox.call_args.args[0]
+        self.assertTrue(cfg_used.restartable)
+        self.assertFalse(cfg_used.reset_session)
+        self.assertTrue(any("Progress will be recorded" in line
+                            for line in self.renderer.lines))
+
+    def test_resume_prompt_offers_existing_session(self):
+        self.cfg = support.make_cfg(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+            csv_file=os.path.join(self.tmp.name, "details.csv"),
+            session_dir=self.tmp.name)
+        mailbox = ("user@contoso.com", "imap.example.com",
+                   "target@example.com", "pw")
+        seed = mig.MigrationSession.load(self.cfg, mailbox)
+        seed.record("m1", "Inbox")
+        seed.close()
+
+        self._patch_world()
+        answers = ["user@contoso.com", "imap.example.com", "target@example.com",
+                   "pw", False, False, True, False, 0, False, False, True]
+        prompter = tui.ScriptedPrompter(answers)
+        rc = tui.run_interactive(self.args, prompter, self.renderer)
+        self.assertEqual(rc, 0, self.renderer.lines)
+        cfg_used = mig.migrate_mailbox.call_args.args[0]
+        self.assertTrue(cfg_used.restartable)
+        self.assertFalse(cfg_used.reset_session)
+        self.assertTrue(any("1 message(s) already migrated" in line
                             for line in self.renderer.lines))
 
     def test_confirmation_defaults_to_no(self):

@@ -99,9 +99,12 @@ The wizard handles **one mailbox** per run:
 6. optionally mirror the folder tree under a root-level target folder: a numbered menu
    when the target has fewer than 10 root folders, otherwise a fuzzy typeahead input;
    a non-matching name is created;
-7. show a **validation screen** (Graph auth, mailbox access, one sample message, IMAP
-   login, folder plan) and the final plan, then ask for confirmation. The confirmation
-   defaults to **No** and only an explicit `y`/`yes` starts the migration;
+7. ask whether to record progress for resuming an interrupted run (default on when a
+   session exists; an existing session can be kept, or deleted and restarted), then
+   show a **validation screen** (Graph auth, mailbox access, one sample message, IMAP
+   login, folder plan, resume state) and the final plan, then ask for confirmation.
+   The confirmation defaults to **No** and only an explicit `y`/`yes` starts the
+   migration;
 8. migrate, report `migrated`/`failed`, and print the equivalent non-interactive command.
 
 The validation screen is the interactive dry run: nothing is fetched in bulk and nothing
