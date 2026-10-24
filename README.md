@@ -109,7 +109,9 @@ The wizard handles **one mailbox** per run:
    **restart command** to resume with if the run is interrupted — then ask for
    confirmation. The confirmation defaults to **No** and only an explicit `y`/`yes`
    starts the migration;
-9. migrate (streaming), report `migrated`/`failed`, and print the restart command again.
+9. migrate (streaming), report `migrated`/`failed`, then automatically verify the
+   migrated messages on the target (content hash + subject decode) and print the
+   restart and re-verify commands.
 
 The validation screen is the interactive dry run: nothing is fetched in bulk and nothing
 is written until the explicit confirmation. `--dry-run` is therefore not needed with `-i`
@@ -134,6 +136,7 @@ fuzzy completer. Feedback on the flow is welcome before it is finalised.
 | `--reset-session` | `RESET_SESSION` | off | Delete existing restart data before migrating (implies `--restartable`) |
 | `--after DATE` | `MIGRATE_AFTER` | no bound | Only messages received on/after DATE (`YYYY-MM-DD` or ISO-8601, UTC) |
 | `--before DATE` | `MIGRATE_BEFORE` | no bound | Only messages received before DATE (exclusive) |
+| `--verify` | - | off | Verify messages recorded in restart sessions against the target (no migration) |
 
 Other `.env` settings: `MIGRATE_ATTACHMENTS` (default **on**), `EMAIL_FORMAT`
 (`html` by default, or `plain`), `IMAP_SSL_VERIFY`, `GRAPH_PAGE_SIZE`,
@@ -173,6 +176,28 @@ Other `.env` settings: `MIGRATE_ATTACHMENTS` (default **on**), `EMAIL_FORMAT`
   so the final count can be smaller.
 - **Parent folder names:** surrounding quotes are stripped, so typing
   `'Office Migration'` (or `"Office Migration"`) targets `Office Migration`.
+- **Unicode / encoding:** Graph returns subjects, bodies, attachment names and
+  folder names as decoded Unicode; the script re-encodes everything safely for
+  the wire:
+  - bodies are written as UTF-8 (`charset="utf-8"`, base64) — the whole message
+    is pure ASCII, so IMAP `APPEND` never needs `8BITMIME`;
+  - non-ASCII subjects become RFC 2047 encoded words and round-trip exactly;
+  - non-ASCII attachment filenames become RFC 2231 `filename*=utf-8''...`;
+  - embedded `<meta charset=...>` / XML declarations inside HTML bodies are
+    rewritten to UTF-8, so mail clients do not mis-decode legacy (e.g.
+    windows-1252) declarations;
+  - non-ASCII target folder names use IMAP modified UTF-7;
+  - messages are sent with CRLF line endings as IMAP requires.
+- **Verification:** with `--restartable`, every appended message is recorded with
+  its target UID (APPENDUID/UIDPLUS), a SHA-256 of the exact bytes sent and the
+  exact subject. `python o365_imap_migration.py --verify` re-reads every recorded
+  message from the target (read-only `BODY.PEEK[]`), compares the content hash
+  (line endings normalized) and checks the subject decodes back to the original
+  — this catches any corruption, including mangled Unicode. The interactive
+  wizard verifies automatically after migrating (`VERIFY_AFTER_MIGRATION=false`
+  to disable). Entries recorded before UID tracking (or after a UIDVALIDITY
+  change) are reported as "not verifiable", not as failures. Exit code is `1`
+  if any recorded message is missing or mismatched.
 - **Restartable:** with `--restartable`, every successfully appended message ID is
   written to `sessions/<source>__<target>__<server>__<hash>.jsonl` (one JSON object
   per line, header validates source/target/parent folder, mode `0600`). A rerun

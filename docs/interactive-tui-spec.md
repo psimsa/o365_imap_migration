@@ -232,13 +232,38 @@ Start the migration? [y/N]
 - If validation found a failure, replace the confirmation prompt with
   `Back to the previous step? [Y/n]` / `Abort [a]`.
 
-### Step 9 — Execute
+### Step 9 — Execute and verify
 
 - Register a `ProgressBoard` (single row) and call `migrate_mailbox(cfg, mailbox, board)`;
   print the final `migrated / failed` summary.
-- Exit `0` when the run completed with `failed == 0`; exit `1` when the run could not
-  be completed (`migrate_mailbox` returned `None`) or any message failed.
-- Final line: counts, elapsed time, and the restart command again.
+- Unless disabled (`VERIFY_AFTER_MIGRATION=false`), verify the migrated messages on
+  the target: `verify_mailbox` re-reads each message recorded in the session
+  (read-only `BODY.PEEK[]`), compares the SHA-256 of the content (line endings
+  normalized) and checks the subject decodes back to the original. The result is
+  printed; problems make the wizard exit `1`.
+- Exit `0` when the run completed with `failed == 0` and verification passed; exit
+  `1` when the run could not be completed (`migrate_mailbox` returned `None`), any
+  message failed, or verification found problems.
+- Final lines: counts, elapsed time, the restart command and the re-verify command
+  (`python o365_imap_migration.py --verify`).
+
+## 4b. Unicode and encoding guarantees
+
+The wizard (and batch mode) must port non-ASCII content losslessly:
+
+- Graph returns subjects, bodies, attachment names and folder names as decoded
+  Unicode; the script re-encodes for the wire: UTF-8 bodies (`charset="utf-8"`,
+  base64), RFC 2047 subjects, RFC 2231 attachment filenames, modified UTF-7 IMAP
+  mailbox names, CRLF line endings. The converted message is pure ASCII, so IMAP
+  APPEND never needs 8BITMIME.
+- Embedded `<meta charset=...>` / XML declarations inside HTML bodies are
+  rewritten to UTF-8 so mail clients do not mis-decode legacy (e.g. windows-1252)
+  declarations.
+- Verification proves it: the content hash comparison catches any byte-level
+  corruption (including mangled Unicode) and the subject decode check catches
+  header-encoding mistakes. A Unicode test battery (Czech/Japanese/emoji
+  subjects, filenames, bodies, nested `.eml`, long-subject folding, UTF-7 round
+  trip) guards the conversion.
 
 ## 5. Components
 

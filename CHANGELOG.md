@@ -12,6 +12,19 @@ Planned release: `1.1.0`. Everything below is on `feature/interactive-tui`
 
 ### Added
 
+- **Unicode/encoding hardening:** HTML bodies get their embedded
+  `<meta charset=...>` / XML declarations rewritten to UTF-8 (Graph returns
+  Unicode, but legacy charset declarations would make clients mis-decode);
+  messages are APPENDed with CRLF line endings; converted output is guaranteed
+  pure ASCII (RFC 2047 subjects, RFC 2231 filenames, modified UTF-7 folder
+  names). Folder-name components containing the hierarchy delimiter no longer
+  nest accidentally, and quotes/backslashes are stripped from folder components.
+- **Verification:** restart sessions now record the target UID (APPENDUID via
+  UIDPLUS), a SHA-256 of the exact bytes appended and the exact subject.
+  `python o365_imap_migration.py --verify` re-reads every recorded message from
+  the target (read-only), compares content hashes (line endings normalized) and
+  checks subjects decode back to the original. The interactive wizard verifies
+  automatically after migrating (`VERIFY_AFTER_MIGRATION`, default on).
 - `--restartable` / `RESTARTABLE`: append-only per-mailbox session files under
   `sessions/` record successfully migrated Graph message IDs; a rerun skips them
   *before* `--limit` is applied, so interrupted migrations continue where they

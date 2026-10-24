@@ -109,6 +109,23 @@ Remote: `origin` -> `git@github.com:psimsa/o365_imap_migration.git` (fork)
       filenames, and both round-trip; no change needed (documented as verified).
 - [x] 50 tests pass on CPython 3.14.6 and 3.12.3.
 
+## Unicode + verification (implemented)
+
+- [x] Conversion guarantees: pure-ASCII output, RFC 2047 subjects, RFC 2231
+      filenames, UTF-8 bodies, modified UTF-7 folder names, CRLF on APPEND.
+- [x] HTML `<meta charset>` / XML encoding declarations rewritten to UTF-8.
+- [x] Sessions record uid + uidvalidity + sha256 + exact subject per message.
+- [x] `--verify` mode: hash + subject-decode verification of every recorded
+      message against the target; wizard auto-verifies after migration.
+- [x] Unicode test battery (13 tests): Czech/Japanese/emoji subjects, filenames,
+      bodies, nested .eml, long-subject folding, UTF-7 round trip incl. astral chars.
+- [x] Verification tests (10): happy path, missing/tampered/subject-mismatch,
+      legacy entries, UIDVALIDITY change, line-ending normalization.
+- [x] Live checks on pavel@simsa.cz: 90/200 recent messages have non-ASCII
+      subjects; 6 real messages with Unicode subjects/filenames converted and
+      round-trip verified clean; 18/18 folder names round-trip through UTF-7.
+- [ ] End-to-end `--verify` against a real IMAP target (needs IMAP credentials).
+
 ## Next / open questions
 
 - [ ] Run a real end-to-end trial (`--dry-run`, then `--limit 25`) and tag `1.1.0`.
