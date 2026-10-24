@@ -7,10 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Planned release: `1.1.0`. Everything below is on branch `feature/migration-controls`.
+Planned release: `1.1.0`. Everything below is on `feature/interactive-tui`
+(based on `feature/migration-controls`).
 
 ### Added
 
+- **Draft interactive wizard** (`-i` / `--interactive`): single-mailbox flow that picks a
+  mailbox from `details.csv` or asks for one, verifies Graph credentials from `.env`
+  (hidden input, optional atomic write-back), shows account statistics, asks for folder
+  scope and a message limit, validates the IMAP login, offers a root-only target parent
+  folder (numbered menu under 10 folders, fuzzy typeahead otherwise, new names are
+  created), then shows a read-only validation screen and the final plan. Confirmation
+  defaults to **No** and no message is written before an explicit `yes`.
+- Optional TUI dependencies in `requirements-tui.txt` (`rich`, `prompt_toolkit`); batch
+  mode does not import them.
+- Unit-test suite (27 tests, hermetic fake Graph/IMAP backends) and a GitHub Actions
+  workflow running it on Python 3.10 and 3.12.
 - `--dry-run`: authenticates against Graph, lists source folders, reads and converts one
   real message, logs in to every target IMAP server (TLS verified) and reports the folder
   mapping, folders to create and per-mailbox OK/FAIL. Writes nothing; exit code `0`/`1`.
@@ -31,6 +43,8 @@ Planned release: `1.1.0`. Everything below is on branch `feature/migration-contr
 
 ### Changed
 
+- `load_config()` accepts `require_credentials=False` so the wizard can prompt for missing
+  `SOURCE_*` values; `migrate_mailbox()` now returns `(migrated, failed)` for callers.
 - Configuration moved from `config.json` to a gitignored `.env` (`python-dotenv`).
   `details.csv` (target passwords) is gitignored as well; templates use the `.example` suffix.
 - Dependencies updated: `O365==2.1.10`, `requests==2.34.2`, `python-dotenv==1.2.4`.

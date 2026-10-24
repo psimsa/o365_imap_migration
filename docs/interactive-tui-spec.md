@@ -1,6 +1,6 @@
 # Interactive mode (`--interactive` / `-i`) — specification & implementation plan
 
-Status: **proposed, not implemented** (spec only, for review)
+Status: **draft implemented** (`interactive.py`) - awaiting user testing/feedback
 Branch: `feature/interactive-tui` (based on `feature/migration-controls`)
 
 ## 1. Goals and non-goals

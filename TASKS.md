@@ -55,17 +55,23 @@ Remote: `origin` -> `git@github.com:psimsa/o365_imap_migration.git` (fork)
 - [ ] Original `Message-ID`/`Reply-To` headers are lost during re-rendering.
 - [ ] Optionally add `--no-progress` for very quiet logs.
 
-## Planned: interactive mode (`-i`)
+## Interactive mode (`-i`) - draft for review
 
-Spec: [docs/interactive-tui-spec.md](docs/interactive-tui-spec.md) (reviewed)
+Spec: [docs/interactive-tui-spec.md](docs/interactive-tui-spec.md) (implemented as draft)
 
-- [ ] Optional `--interactive` / `-i` wizard for a single mailbox.
-- [ ] Verify (and optionally persist) Graph credentials from `.env`.
-- [ ] Account statistics + migration plan preview.
-- [ ] Folder / message-limit scope selection.
-- [ ] IMAP credential validation and root-only parent-folder picker with fuzzy input.
-- [ ] Read-only validation screen (Graph creds, mailbox, sample message, IMAP, folder
+- [x] Optional `--interactive` / `-i` wizard for a single mailbox.
+- [x] Verify (and optionally persist) Graph credentials from `.env`.
+- [x] Account statistics + migration plan preview.
+- [x] Folder / message-limit scope selection.
+- [x] IMAP credential validation and root-only parent-folder picker with fuzzy input.
+- [x] Read-only validation screen (Graph creds, mailbox, sample message, IMAP, folder
       plan) instead of a dry-run action; migration only after an explicit `yes`
       (confirmation defaults to No).
-- [ ] Optional CSV row append; optional TUI dependencies (`requirements-tui.txt`),
-      tests and docs.
+- [x] Optional CSV row append; optional TUI dependencies (`requirements-tui.txt`).
+- [x] Hermetic unit tests (27) and GitHub Actions workflow (Python 3.10/3.12).
+- [ ] User testing and feedback on the draft; then finalise prompts/flow and release.
+
+Draft deviations from the spec: folder selection uses numbered inputs rather than
+full-screen checkbox dialogs (SSH/narrow-terminal friendly); the parent-folder typeahead
+uses `prompt_toolkit`'s fuzzy completer. `PromptToolkitPrompter`/`RichRenderer` need a
+manual TTY test, unit tests use `ScriptedPrompter` + `PlainRenderer`.

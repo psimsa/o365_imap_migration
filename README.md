@@ -12,6 +12,7 @@ Microsoft Graph, and appends each message to the target IMAP account.
 
 - Python 3.10+
 - `python -m pip install -r requirements.txt`
+- Optional, for the interactive wizard: `python -m pip install -r requirements-tui.txt`
 - An Entra app registration with **application** permissions (not delegated) and
   admin consent:
 
@@ -77,10 +78,43 @@ python o365_imap_migration.py --folders "Inbox,Sent Items,Archive/2024" --limit 
 python o365_imap_migration.py --target-parent-folder Scratch --folders Inbox --limit 25
 ```
 
+## Interactive mode (draft)
+
+```bash
+python -m pip install -r requirements-tui.txt
+python o365_imap_migration.py -i
+```
+
+The wizard handles **one mailbox** per run:
+
+1. pick a row from `details.csv` or enter a source mailbox manually;
+2. verify the Graph app credentials from `.env`, prompting (hidden input) if they are
+   missing or rejected, with an optional, atomic write-back to `.env`;
+3. show account statistics (folders, message counts, sizes);
+4. choose all folders or a subset (a parent also selects its subfolders) and an optional
+   message limit;
+5. ask for the target IMAP credentials and verify the login with TLS;
+6. optionally mirror the folder tree under a root-level target folder: a numbered menu
+   when the target has fewer than 10 root folders, otherwise a fuzzy typeahead input;
+   a non-matching name is created;
+7. show a **validation screen** (Graph auth, mailbox access, one sample message, IMAP
+   login, folder plan) and the final plan, then ask for confirmation. The confirmation
+   defaults to **No** and only an explicit `y`/`yes` starts the migration;
+8. migrate, report `migrated`/`failed`, and print the equivalent non-interactive command.
+
+The validation screen is the interactive dry run: nothing is fetched in bulk and nothing
+is written until the explicit confirmation. `--dry-run` is therefore not needed with `-i`
+(a note is printed if both are given). `Ctrl-C` aborts without writing.
+
+Draft notes: selection prompts are numbered inputs (not full-screen dialogs) so the wizard
+works over SSH and in narrow terminals; the parent-folder input uses `prompt_toolkit`'s
+fuzzy completer. Feedback on the flow is welcome before it is finalised.
+
 ## Options
 
 | CLI | `.env` | Default | Meaning |
 | --- | --- | --- | --- |
+| `-i`, `--interactive` | - | off | Guided single-mailbox wizard (needs `requirements-tui.txt`) |
 | `--dry-run` | - | off | Verify credentials/access and report; writes nothing |
 | `--csv PATH` | `CSV_FILE` | `details.csv` | Mailbox list |
 | `--env-file PATH` | - | `.env` | Environment file |
@@ -128,6 +162,12 @@ Other `.env` settings: `MIGRATE_ATTACHMENTS`, `EMAIL_FORMAT` (`html`/`plain`),
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history. Unreleased highlights:
+
+- Draft interactive wizard (`-i`) with optional `.env` write-back, account stats,
+  folder/limit selection, parent-folder picker, validation screen and
+  confirmation-default-No.
+- Unit tests (`python -m unittest discover -s tests -t .`) and a GitHub Actions
+  workflow running them on Python 3.10 and 3.12.
 
 - `Mail.Read` is the only Graph permission required (README previously asked for
   `Mail.ReadWrite` and `User.Read.All` as well).
