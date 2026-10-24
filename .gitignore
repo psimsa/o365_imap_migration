@@ -4,6 +4,7 @@
 !.env.example
 details.csv
 tokens/
+sessions/
 .venv/
 
 # Python

@@ -302,6 +302,10 @@ class Plan:
     email_format: str
     imap_ssl_verify: bool
     warnings: list[str] = field(default_factory=list)
+    restartable: bool = False
+    resume_count: int = 0
+    migrate_after: str = ""
+    migrate_before: str = ""
 
 
 @dataclass
@@ -326,6 +330,18 @@ def validate_positive_int(value):
     if not str(value).strip().isdigit() or int(value) <= 0:
         raise ValueError("enter a positive integer")
     return int(value)
+
+
+def validate_date_text(value):
+    """Empty is allowed; otherwise must parse as a date/timestamp."""
+    text = (value or "").strip()
+    if not text:
+        return text
+    try:
+        mig.normalize_date_bound(text)
+    except mig.MigrationError as exc:
+        raise ValueError(str(exc)) from None
+    return text
 
 
 def validate_parent_name(value, delimiter="/"):
@@ -382,7 +398,7 @@ def plan_targets(cfg, folders, delimiter, existing_names):
     return create, reuse, warnings
 
 
-def build_plan(cfg, mailbox, folders, delimiter, existing_names):
+def build_plan(cfg, mailbox, folders, delimiter, existing_names, resume_count=0):
     create, reuse, warnings = plan_targets(cfg, folders, delimiter, existing_names)
     total = sum(folder.get("totalItemCount") or 0 for folder in folders)
     if cfg.migrate_limit:
@@ -410,7 +426,20 @@ def build_plan(cfg, mailbox, folders, delimiter, existing_names):
         email_format=cfg.email_format,
         imap_ssl_verify=cfg.imap_ssl_verify,
         warnings=warnings,
+        restartable=cfg.restartable,
+        resume_count=resume_count,
+        migrate_after=cfg.migrate_after,
+        migrate_before=cfg.migrate_before,
     )
+
+
+def _describe_dates(plan):
+    parts = []
+    if plan.migrate_after:
+        parts.append(f"after {plan.migrate_after}")
+    if plan.migrate_before:
+        parts.append(f"before {plan.migrate_before}")
+    return ", ".join(parts) or "none"
 
 
 def plan_rows(plan):
@@ -431,6 +460,9 @@ def plan_rows(plan):
         ("Target", f"{plan.target_email} @ {plan.target_server}"),
         ("Folders", folders),
         ("Limit", f"newest {plan.limit} message(s)" if plan.limit else "all messages"),
+        ("Time filter", _describe_dates(plan)),
+        ("Restartable", (f"on ({plan.resume_count} message(s) already migrated)"
+                         if plan.restartable else "off")),
         ("Attachments", "on" if plan.attachments else "off"),
         ("Body format", plan.email_format),
         ("Target parent", parent),
@@ -615,10 +647,31 @@ class Wizard:
         else:
             limit = 0
 
+        if self.prompter.confirm(
+                "Filter messages by received date?",
+                default=bool(self.cfg.migrate_after or self.cfg.migrate_before)):
+            while True:
+                after_raw = self.prompter.text(
+                    "Only messages received on/after (YYYY-MM-DD, empty = none)",
+                    default=self.cfg.migrate_after, validate=validate_date_text)
+                before_raw = self.prompter.text(
+                    "Only messages received before (YYYY-MM-DD, empty = none)",
+                    default=self.cfg.migrate_before, validate=validate_date_text)
+                after = mig.normalize_date_bound(after_raw)
+                before = mig.normalize_date_bound(before_raw)
+                if after and before and after >= before:
+                    self.renderer.warn("'after' must be earlier than 'before'; try again.")
+                    continue
+                break
+        else:
+            after = before = ""
+
         self.cfg = replace(
             self.cfg,
             migrate_folders=[folder["path"] for folder in self.selected],
             migrate_limit=limit,
+            migrate_after=after,
+            migrate_before=before,
         )
 
     def step_imap(self):
@@ -707,10 +760,14 @@ class Wizard:
             # system folders such as "Sync Issues".
             candidates.sort(key=lambda item: item["displayName"] != "Inbox")
             folder = candidates[0]
+            params = {"$top": 1}
+            filter_expression = mig.build_received_filter(self.cfg)
+            if filter_expression:
+                params["$filter"] = filter_expression
             page = mig.graph_get(
                 f"{mig._user_url(self.mailbox.source_email)}"
                 f"/mailFolders/{folder['id']}/messages",
-                self.access_token, params={"$top": 1})
+                self.access_token, params=params)
             messages = page.get("value") or []
             if not messages:
                 return Check("Sample message", True, "selection is empty")
@@ -739,8 +796,25 @@ class Wizard:
                   f"{self.mailbox.target_server} "
                   f"({'TLS verified' if self.cfg.imap_ssl_verify else 'TLS NOT verified'})"),
         ]
+        resume_count = 0
+        if self.cfg.restartable:
+            if self.cfg.reset_session:
+                checks.append(Check("Resume session", True,
+                                    "will be reset (--reset-session)"))
+            else:
+                try:
+                    session = mig.MigrationSession.load(
+                        self.cfg, (self.mailbox.source_email, self.mailbox.target_server,
+                                   self.mailbox.target_email, self.mailbox.password))
+                    resume_count = len(session.ids)
+                    session.close()
+                    checks.append(Check("Resume session", True,
+                                        f"{resume_count} message(s) already migrated"))
+                except Exception as exc:
+                    checks.append(Check("Resume session", False, str(exc)))
+
         plan = build_plan(self.cfg, self.mailbox, self.selected,
-                          self.delimiter, self.target_names)
+                          self.delimiter, self.target_names, resume_count=resume_count)
         checks.append(Check("Folder plan", True,
                             f"{plan.create_count} to create, {plan.reuse_count} reused"))
         return checks, plan
@@ -891,22 +965,31 @@ def run_interactive(args, prompter=None, renderer=None):
 
     try:
         cfg = mig.load_config(args.env_file, require_credentials=False)
+        if args.csv:
+            cfg = replace(cfg, csv_file=args.csv)
+        if getattr(args, "target_parent_folder", None) is not None:
+            cfg = replace(cfg, target_parent_folder=mig.normalize_parent_folder(
+                args.target_parent_folder))
+        if getattr(args, "folders", None) is not None:
+            cfg = replace(cfg, migrate_folders=mig.parse_folder_list(args.folders))
+        if getattr(args, "limit", None) is not None:
+            if args.limit < 0:
+                raise mig.MigrationError("--limit must be 0 or a positive integer")
+            cfg = replace(cfg, migrate_limit=args.limit)
+        if getattr(args, "after", None) is not None:
+            cfg = replace(cfg, migrate_after=mig.normalize_date_bound(args.after))
+        if getattr(args, "before", None) is not None:
+            cfg = replace(cfg, migrate_before=mig.normalize_date_bound(args.before))
+        if cfg.migrate_after and cfg.migrate_before and \
+                cfg.migrate_after >= cfg.migrate_before:
+            raise mig.MigrationError("--after must be earlier than --before")
+        if getattr(args, "restartable", False) or getattr(args, "reset_session", False):
+            cfg = replace(cfg, restartable=True)
+        if getattr(args, "reset_session", False):
+            cfg = replace(cfg, reset_session=True)
     except mig.MigrationError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
-
-    if args.csv:
-        cfg = replace(cfg, csv_file=args.csv)
-    if getattr(args, "target_parent_folder", None) is not None:
-        cfg = replace(cfg, target_parent_folder=mig.normalize_parent_folder(
-            args.target_parent_folder))
-    if getattr(args, "folders", None) is not None:
-        cfg = replace(cfg, migrate_folders=mig.parse_folder_list(args.folders))
-    if getattr(args, "limit", None) is not None:
-        if args.limit < 0:
-            print("Error: --limit must be 0 or a positive integer", file=sys.stderr)
-            return 2
-        cfg = replace(cfg, migrate_limit=args.limit)
 
     renderer.info("Interactive migration - one mailbox. Ctrl-C aborts.")
     if getattr(args, "dry_run", False):

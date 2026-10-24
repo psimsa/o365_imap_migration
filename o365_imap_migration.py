@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hashlib
 import html
 import imaplib
 import json
@@ -45,6 +46,7 @@ except ImportError as exc:  # pragma: no cover - dependency check
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 TOKENS_DIR = "tokens"
+SESSIONS_DIR = "sessions"
 DEFAULT_ENV = ".env"
 DEFAULT_CSV = "details.csv"
 CSV_HEADER = ["source_email", "target_server", "target_email", "target_password"]
@@ -248,6 +250,11 @@ class Config:
     target_parent_folder: str = ""
     migrate_folders: list[str] = field(default_factory=list)
     migrate_limit: int = 0  # 0 = everything
+    migrate_after: str = ""   # receivedDateTime >= (UTC ISO-8601)
+    migrate_before: str = ""  # receivedDateTime <  (UTC ISO-8601)
+    restartable: bool = False
+    reset_session: bool = False
+    session_dir: str = SESSIONS_DIR
 
 
 def env_bool(name, default=False):
@@ -280,6 +287,36 @@ def normalize_parent_folder(value):
     return "/".join(part.strip() for part in (value or "").split("/") if part.strip())
 
 
+def normalize_date_bound(value):
+    """Normalizes YYYY-MM-DD or ISO-8601 to a UTC ``YYYY-MM-DDTHH:MM:SSZ`` string."""
+    text = (value or "").strip()
+    if not text:
+        return ""
+    try:
+        if len(text) == 10:
+            parsed = datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        else:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        raise MigrationError(
+            f"invalid date {value!r}; use YYYY-MM-DD or an ISO-8601 timestamp") from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_received_filter(cfg):
+    """Graph ``$filter`` expression for the configured received-date range."""
+    after = normalize_date_bound(cfg.migrate_after)
+    before = normalize_date_bound(cfg.migrate_before)
+    clauses = []
+    if after:
+        clauses.append(f"receivedDateTime ge {after}")
+    if before:
+        clauses.append(f"receivedDateTime lt {before}")
+    return " and ".join(clauses)
+
+
 def load_config(env_file=None, require_credentials=True):
     """Load settings from a .env file (and the process environment).
 
@@ -304,6 +341,11 @@ def load_config(env_file=None, require_credentials=True):
     if email_format not in ("html", "plain"):
         raise MigrationError(f"EMAIL_FORMAT must be 'html' or 'plain', got {email_format!r}")
 
+    migrate_after = normalize_date_bound(os.getenv("MIGRATE_AFTER", ""))
+    migrate_before = normalize_date_bound(os.getenv("MIGRATE_BEFORE", ""))
+    if migrate_after and migrate_before and migrate_after >= migrate_before:
+        raise MigrationError("MIGRATE_AFTER must be earlier than MIGRATE_BEFORE")
+
     return Config(
         client_id=(os.getenv("SOURCE_CLIENT_ID") or "").strip(),
         client_secret=(os.getenv("SOURCE_CLIENT_SECRET") or "").strip(),
@@ -316,6 +358,11 @@ def load_config(env_file=None, require_credentials=True):
         target_parent_folder=normalize_parent_folder(os.getenv("TARGET_PARENT_FOLDER", "")),
         migrate_folders=parse_folder_list(os.getenv("MIGRATE_FOLDERS", "")),
         migrate_limit=env_int("MIGRATE_LIMIT", 0, 0, 1_000_000_000),
+        migrate_after=migrate_after,
+        migrate_before=migrate_before,
+        restartable=env_bool("RESTARTABLE", False),
+        reset_session=env_bool("RESET_SESSION", False),
+        session_dir=(os.getenv("SESSION_DIR") or SESSIONS_DIR).strip(),
     )
 
 
@@ -358,6 +405,152 @@ def read_mailboxes_from_csv(filename):
             seen.add(key)
             mailboxes.append((source_email, target_server, target_email, target_password))
     return mailboxes
+
+
+# Restartable sessions -------------------------------------------------------
+
+def utcnow_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def session_path(cfg, mailbox):
+    """Deterministic per-mailbox session file path."""
+    source, server, target, _ = mailbox
+    slug = re.sub(r"[^A-Za-z0-9._@-]+", "_", f"{source}__{target}__{server}")[:80]
+    key = "|".join(value.strip().lower() for value in (source, target, server))
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    return os.path.join(cfg.session_dir, f"{slug}__{digest}.jsonl")
+
+
+class MigrationSession:
+    """Append-only record of message IDs already appended to the target.
+
+    One JSON object per line; a torn last line (crash during write) is ignored.
+    The first line is a header that identifies the source/target/parent folder so a
+    session from a different migration is never mixed in by accident.
+    """
+
+    VERSION = 1
+
+    def __init__(self, path, source, target, server, parent_folder):
+        self.path = path
+        self.source = source
+        self.target = target
+        self.server = server
+        self.parent_folder = parent_folder
+        self.ids = set()
+        self.written = 0
+        self._handle = None
+        self._since_sync = 0
+
+    @classmethod
+    def load(cls, cfg, mailbox):
+        source, server, target, _ = mailbox
+        session = cls(session_path(cfg, mailbox), source, target, server,
+                      cfg.target_parent_folder)
+        if not os.path.exists(session.path):
+            return session
+
+        header = None
+        with open(session.path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue  # tolerate a partially written trailing line
+                if header is None:
+                    if entry.get("type") == "header":
+                        header = entry
+                    continue
+                if entry.get("id"):
+                    session.ids.add(str(entry["id"]))
+
+        if header is None:
+            safe_print(f"Warning: ignoring session file without header: {session.path}")
+            session.ids.clear()
+            return session
+
+        expected = (source, target, server, cfg.target_parent_folder)
+        actual = (header.get("source", ""), header.get("target", ""),
+                  header.get("server", ""), header.get("parent_folder", ""))
+        if (tuple(value.strip().lower() for value in actual)
+                != tuple(value.strip().lower() for value in expected)):
+            raise MigrationError(
+                f"session file {session.path} belongs to a different migration "
+                f"({actual[0]} -> {actual[1]} @ {actual[2]}, parent {actual[3]!r}); "
+                f"use --reset-session to start over")
+        return session
+
+    def reset(self):
+        """Deletes the session file (used by --reset-session)."""
+        self._close()
+        if os.path.exists(self.path):
+            os.remove(self.path)
+        self.ids.clear()
+        self.written = 0
+        return self
+
+    def contains(self, message_id):
+        return str(message_id) in self.ids
+
+    def record(self, message_id, folder=""):
+        message_id = str(message_id)
+        if message_id in self.ids:
+            return
+        self._ensure_open()
+        entry = {"id": message_id, "folder": folder, "ts": utcnow_iso()}
+        self._handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        self._handle.flush()
+        self.ids.add(message_id)
+        self.written += 1
+        self._since_sync += 1
+        if self._since_sync >= 32:
+            os.fsync(self._handle.fileno())
+            self._since_sync = 0
+
+    def _ensure_open(self):
+        if self._handle is not None:
+            return
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        new_file = not os.path.exists(self.path)
+        self._handle = open(self.path, "a", encoding="utf-8")
+        if new_file:
+            header = {
+                "type": "header", "version": self.VERSION,
+                "source": self.source, "target": self.target,
+                "server": self.server, "parent_folder": self.parent_folder,
+                "created": utcnow_iso(),
+            }
+            self._handle.write(json.dumps(header, separators=(",", ":")) + "\n")
+            self._handle.flush()
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
+
+    def _close(self):
+        if self._handle is not None:
+            try:
+                self._handle.flush()
+                os.fsync(self._handle.fileno())
+            except OSError:
+                pass
+            self._handle.close()
+            self._handle = None
+
+    def close(self):
+        self._close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 # Microsoft Graph ------------------------------------------------------------
@@ -410,19 +603,32 @@ def graph_get(url, access_token, params=None, timeout=60, max_attempts=5):
     raise GraphError(f"GET {url} failed after {max_attempts} attempts: {last_error}")
 
 
-def graph_get_all(url, access_token, params=None, timeout=60, limit=None, on_page=None):
+def graph_get_all(url, access_token, params=None, timeout=60, limit=None,
+                  on_page=None, skip_ids=None):
     """GET every page of a Graph collection by following @odata.nextLink.
 
     Graph returns at most 10 items per page by default, so ignoring
     @odata.nextLink silently drops everything after the first page.
+
+    ``skip_ids`` removes already-migrated message IDs *before* the limit is
+    applied, so a resumed run with ``--limit N`` fetches N *new* messages.
     """
     items = []
+    done = False
     next_url, next_params = url, params
-    while next_url and (limit is None or len(items) < limit):
+    while next_url and not done:
         page = graph_get(next_url, access_token, params=next_params, timeout=timeout)
-        items.extend(page.get("value", []))
+        for item in page.get("value", []):
+            if skip_ids and str(item.get("id")) in skip_ids:
+                continue
+            items.append(item)
+            if limit is not None and len(items) >= limit:
+                done = True
+                break
         if on_page is not None:
             on_page(len(items))
+        if done:
+            break
         next_url = page.get("@odata.nextLink")
         # The nextLink already carries the query string of the original request.
         next_params = None
@@ -491,8 +697,11 @@ def fetch_attachments(access_token, email_address, message_id):
     return graph_get_all(url, access_token)
 
 
-def fetch_all_emails(cfg, source_email, access_token):
-    """Fetch the selected emails from the source email account."""
+def fetch_all_emails(cfg, source_email, access_token, skip_ids=None):
+    """Fetch the selected emails from the source email account.
+
+    ``skip_ids`` holds message IDs already recorded in a restartable session.
+    """
     folders = get_mail_folders(cfg, access_token, source_email)
     selected, missing = select_folders(folders, cfg.migrate_folders)
     for name in missing:
@@ -509,6 +718,10 @@ def fetch_all_emails(cfg, source_email, access_token):
             break
 
         top = cfg.graph_page_size if remaining is None else min(cfg.graph_page_size, remaining)
+        params = {"$top": top}
+        filter_expression = build_received_filter(cfg)
+        if filter_expression:
+            params["$filter"] = filter_expression
         last_report = [0.0]
 
         def on_page(count, path=folder["path"]):
@@ -521,9 +734,10 @@ def fetch_all_emails(cfg, source_email, access_token):
             messages = graph_get_all(
                 f"{_user_url(source_email)}/mailFolders/{folder['id']}/messages",
                 access_token,
-                params={"$top": top},
+                params=params,
                 limit=remaining,
                 on_page=on_page,
+                skip_ids=skip_ids,
             )
         except GraphError as e:
             safe_print(f"[{source_email}] failed to fetch emails from folder "
@@ -900,7 +1114,7 @@ def _append_with_retries(mail, wire_folder, payload, attempts=3):
     return False
 
 
-def migrate_emails(cfg, target_mail, messages, board=None, key=None):
+def migrate_emails(cfg, target_mail, messages, board=None, key=None, session=None):
     """Migrates a list of Graph message dictionaries to the target account."""
     delimiter, existing = get_imap_hierarchy(target_mail)
     state = {"existing": {name.lower() for name in existing}}
@@ -910,6 +1124,7 @@ def migrate_emails(cfg, target_mail, messages, board=None, key=None):
 
     for msg in messages:
         ok = False
+        display_folder = ""
         try:
             if not isinstance(msg, dict):
                 safe_print(f"Unexpected message format: {msg!r}")
@@ -941,6 +1156,8 @@ def migrate_emails(cfg, target_mail, messages, board=None, key=None):
 
         if ok:
             migrated += 1
+            if session is not None:
+                session.record(msg.get("id"), display_folder)
         else:
             failed += 1
         if board is not None and key is not None:
@@ -955,11 +1172,25 @@ def migrate_mailbox(cfg, mailbox, board=None):
     safe_print(f"[{source_email}] starting migration to {target_email} ({target_server})")
 
     key = None
+    session = None
     try:
         access_token, _ = authenticate_account(cfg, source_email)
-        messages = fetch_all_emails(cfg, source_email, access_token)
+        if cfg.restartable:
+            if cfg.reset_session:
+                MigrationSession(session_path(cfg, mailbox), source_email, target_email,
+                                 target_server, cfg.target_parent_folder).reset()
+            session = MigrationSession.load(cfg, mailbox)
+            safe_print(f"[{source_email}] restartable session {session.path} "
+                       f"({len(session.ids)} message(s) already recorded)")
+
+        messages = fetch_all_emails(cfg, source_email, access_token,
+                                    skip_ids=session.ids if session is not None else None)
         if not messages:
-            safe_print(f"[{source_email}] no messages to migrate.")
+            if session is not None:
+                safe_print(f"[{source_email}] nothing new to migrate "
+                           f"({len(session.ids)} message(s) in the session).")
+            else:
+                safe_print(f"[{source_email}] no messages to migrate.")
             return 0, 0
 
         safe_print(f"[{source_email}] fetched {len(messages)} message(s); "
@@ -973,12 +1204,15 @@ def migrate_mailbox(cfg, mailbox, board=None):
             key = board.register(source_email, len(messages))
 
         try:
-            migrated, failed = migrate_emails(cfg, target_mail, messages, board, key)
+            migrated, failed = migrate_emails(cfg, target_mail, messages, board, key,
+                                              session=session)
         finally:
             try:
                 target_mail.logout()
             except Exception:
                 pass
+            if session is not None:
+                session.close()
 
         if board is not None and key is not None:
             board.finish(key, "done" if failed == 0 else "done with errors")
@@ -990,6 +1224,8 @@ def migrate_mailbox(cfg, mailbox, board=None):
     except Exception as e:
         if board is not None and key is not None:
             board.finish(key, "failed")
+        if session is not None:
+            session.close()
         safe_print(f"[{source_email}] migration failed: {e}")
         return 0, 0
 
@@ -1033,7 +1269,12 @@ def _describe_filters(cfg):
     parts.append(f"folders={','.join(cfg.migrate_folders)}" if cfg.migrate_folders
                  else "folders=all")
     parts.append(f"limit={cfg.migrate_limit or 'all'}")
+    if cfg.migrate_after:
+        parts.append(f"after={cfg.migrate_after}")
+    if cfg.migrate_before:
+        parts.append(f"before={cfg.migrate_before}")
     parts.append(f"target parent={cfg.target_parent_folder or '(none)'}")
+    parts.append(f"restartable={'on' if cfg.restartable else 'off'}")
     return ", ".join(parts)
 
 
@@ -1176,6 +1417,17 @@ def parse_args(argv=None):
                         help="migrate at most N messages per mailbox (0 = all)")
     parser.add_argument("-i", "--interactive", action="store_true",
                         help="guided single-mailbox wizard (needs requirements-tui.txt)")
+    parser.add_argument("--restartable", action="store_true",
+                        help="record migrated message IDs per mailbox and resume later")
+    parser.add_argument("--reset-session", action="store_true",
+                        help="delete existing restart data before migrating (implies "
+                             "--restartable)")
+    parser.add_argument("--after", metavar="DATE",
+                        help="only messages received on/after DATE "
+                             "(YYYY-MM-DD or ISO-8601, UTC)")
+    parser.add_argument("--before", metavar="DATE",
+                        help="only messages received before DATE "
+                             "(YYYY-MM-DD or ISO-8601, UTC)")
     return parser.parse_args(argv)
 
 
@@ -1200,6 +1452,16 @@ def main(argv=None):
             if args.limit < 0:
                 raise MigrationError("--limit must be 0 or a positive integer")
             cfg.migrate_limit = args.limit
+        if args.after is not None:
+            cfg.migrate_after = normalize_date_bound(args.after)
+        if args.before is not None:
+            cfg.migrate_before = normalize_date_bound(args.before)
+        if cfg.migrate_after and cfg.migrate_before and cfg.migrate_after >= cfg.migrate_before:
+            raise MigrationError("--after must be earlier than --before")
+        if args.restartable or args.reset_session:
+            cfg.restartable = True
+        if args.reset_session:
+            cfg.reset_session = True
         mailboxes = read_mailboxes_from_csv(cfg.csv_file)
     except MigrationError as e:
         print(f"Error: {e}", file=sys.stderr)

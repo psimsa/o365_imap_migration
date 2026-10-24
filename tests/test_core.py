@@ -1,3 +1,4 @@
+import json
 import os
 import ssl
 import tempfile
@@ -7,6 +8,10 @@ from unittest import mock
 from tests import support
 
 mig = support.mig
+
+
+def stat_mode(path):
+    return os.stat(path).st_mode & 0o777
 
 
 class CoreTests(unittest.TestCase):
@@ -103,6 +108,104 @@ class CoreTests(unittest.TestCase):
         cfg = mig.Config(client_id="", client_secret="", tenant_id="")
         self.assertTrue(cfg.migrate_attachments)
         self.assertEqual(cfg.email_format, "html")
+
+    def test_date_parsing_and_graph_filter(self):
+        self.assertEqual(mig.normalize_date_bound("2024-03-01"),
+                         "2024-03-01T00:00:00Z")
+        self.assertEqual(mig.normalize_date_bound("2024-03-01T12:30:00+02:00"),
+                         "2024-03-01T10:30:00Z")
+        cfg = support.make_cfg(migrate_after="2020-01-01",
+                               migrate_before="2021-06-01")
+        self.assertEqual(
+            mig.build_received_filter(cfg),
+            "receivedDateTime ge 2020-01-01T00:00:00Z and "
+            "receivedDateTime lt 2021-06-01T00:00:00Z")
+        with self.assertRaises(mig.MigrationError):
+            mig.normalize_date_bound("not-a-date")
+
+    def test_fetch_passes_time_filter_to_graph(self):
+        cfg = support.make_cfg(migrate_after="2023-01-01",
+                               migrate_before="2024-01-01")
+        mig.fetch_all_emails(cfg, "u@example.com", "token")
+        filters = [params.get("$filter") for url, params in support.FakeRequests.calls
+                   if url.endswith("/messages")]
+        self.assertTrue(filters)
+        self.assertIn("receivedDateTime ge 2023-01-01T00:00:00Z", filters[0])
+        self.assertIn("receivedDateTime lt 2024-01-01T00:00:00Z", filters[0])
+
+    def test_skip_ids_applied_before_limit(self):
+        messages = mig.graph_get_all(
+            "https://graph.test/messages", "token", params={"$top": 100},
+            limit=1, skip_ids={"m1", "m2"})
+        self.assertEqual([item["id"] for item in messages], ["m3"])
+
+    def test_session_roundtrip_reset_and_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = support.make_cfg(restartable=True, session_dir=tmp)
+            mailbox = ("u@example.com", "imap.example.com", "t@example.com", "pw")
+            session = mig.MigrationSession.load(cfg, mailbox)
+            session.record("m1", "Inbox")
+            session.record("m2", "Inbox")
+            session.close()
+
+            path = mig.session_path(cfg, mailbox)
+            self.assertTrue(os.path.exists(path))
+            self.assertEqual(stat_mode(path), 0o600)
+            reloaded = mig.MigrationSession.load(cfg, mailbox)
+            self.assertEqual(reloaded.ids, {"m1", "m2"})
+            reloaded.close()
+
+            other = ("u@example.com", "imap.example.com", "x@example.com", "pw")
+            other_path = mig.session_path(cfg, other)
+            with open(other_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "type": "header", "version": 1, "source": "u@example.com",
+                    "target": "t@example.com", "server": "imap.example.com",
+                    "parent_folder": ""}) + "\n")
+            with self.assertRaises(mig.MigrationError):
+                mig.MigrationSession.load(cfg, other)
+
+            mig.MigrationSession.load(cfg, mailbox).reset()
+            self.assertFalse(os.path.exists(path))
+
+    def test_migrate_emails_records_only_successes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = support.make_cfg(restartable=True, session_dir=tmp)
+            mailbox = ("u@example.com", "imap.example.com", "t@example.com", "pw")
+            session = mig.MigrationSession.load(cfg, mailbox)
+            messages = [support.message(1), support.message(2)]
+            migrated, failed = mig.migrate_emails(
+                cfg, support.FakeIMAP(), messages, session=session)
+            self.assertEqual((migrated, failed), (2, 0))
+            self.assertEqual(session.ids, {"m1", "m2"})
+            session.close()
+
+    def test_migrate_mailbox_resumes_from_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = support.make_cfg(restartable=True, session_dir=tmp)
+            mailbox = ("u@example.com", "imap.example.com", "t@example.com", "pw")
+            seed = mig.MigrationSession.load(cfg, mailbox)
+            seed.record("m1", "Inbox")
+            seed.close()
+
+            seen = {}
+
+            def fake_fetch(cfg_, source, token, skip_ids=None):
+                seen["skip"] = set(skip_ids or ())
+                return [support.message(2)]
+
+            with mock.patch.object(mig, "authenticate_account",
+                                   return_value=("token", None)), \
+                    mock.patch.object(mig, "fetch_all_emails", side_effect=fake_fetch), \
+                    mock.patch.object(mig, "connect_to_target_imap",
+                                      return_value=support.FakeIMAP()):
+                migrated, failed = mig.migrate_mailbox(cfg, mailbox)
+
+            self.assertEqual((migrated, failed), (1, 0))
+            self.assertEqual(seen["skip"], {"m1"})
+            session = mig.MigrationSession.load(cfg, mailbox)
+            self.assertEqual(session.ids, {"m1", "m2"})
+            session.close()
 
     def test_utf7_and_target_paths(self):
         self.assertEqual(mig.imap_utf7_encode("~peter/mail/台北/日本語"),

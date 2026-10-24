@@ -127,6 +127,16 @@ class PureHelperTests(unittest.TestCase):
             self.assertEqual(len(lines), 3)
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
 
+    def test_plan_shows_time_filter_and_resume(self):
+        cfg = support.make_cfg(restartable=True,
+                               migrate_after="2020-01-01T00:00:00Z")
+        plan = tui.build_plan(cfg, tui.MailboxChoice("u@example.com"),
+                              support.sample_folders(), "/", ["INBOX"],
+                              resume_count=4)
+        rows = dict(tui.plan_rows(plan))
+        self.assertIn("after 2020-01-01", rows["Time filter"])
+        self.assertIn("4 message(s)", rows["Restartable"])
+
     def test_scripted_confirm_defaults(self):
         self.assertFalse(tui.ScriptedPrompter([None]).confirm("q", default=False))
         self.assertTrue(tui.ScriptedPrompter([None]).confirm("q", default=True))
@@ -181,6 +191,7 @@ class FlowTests(unittest.TestCase):
             False,                # mirror under parent folder
             0,                    # all folders
             False,                # no message limit
+            False,                # no received-date filter
         ]
 
     def test_full_flow_migrates_after_confirmation(self):
@@ -201,6 +212,20 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(mailbox, ("user@contoso.com", "imap.example.com",
                                    "target@example.com", "pw"))
         self.assertTrue(any("Rerun non-interactively" in line
+                            for line in self.renderer.lines))
+        self.assertTrue(any("Time filter" in line for line in self.renderer.lines))
+        self.assertTrue(any("Restartable" in line for line in self.renderer.lines))
+
+    def test_date_filter_is_applied(self):
+        self._patch_world()
+        answers = self._answers()[:8] + [True, "2020-01-01", "2021-01-01", True]
+        prompter = tui.ScriptedPrompter(answers)
+        rc = tui.run_interactive(self.args, prompter, self.renderer)
+        self.assertEqual(rc, 0, self.renderer.lines)
+        cfg_used = mig.migrate_mailbox.call_args.args[0]
+        self.assertEqual(cfg_used.migrate_after, "2020-01-01T00:00:00Z")
+        self.assertEqual(cfg_used.migrate_before, "2021-01-01T00:00:00Z")
+        self.assertTrue(any("after 2020-01-01" in line
                             for line in self.renderer.lines))
 
     def test_confirmation_defaults_to_no(self):
