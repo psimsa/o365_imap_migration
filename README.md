@@ -152,6 +152,12 @@ Other `.env` settings: `MIGRATE_ATTACHMENTS` (default **on**), `EMAIL_FORMAT`
   modified UTF-7 for non-ASCII names. Without it, `Inbox`, `Drafts`, `Sent Items`,
   `Deleted Items` and `Junk Email` map to their usual IMAP names; unknown folders
   fall back to `INBOX` and the dry run reports them.
+- **Attachments:** file attachments are copied as-is. Attached emails
+  (`itemAttachment`) are fetched with `$expand=microsoft.graph.itemAttachment/item`
+  and re-attached as `message/rfc822` (`.eml`), including their own attachments when
+  Graph returns them. Cloud-link attachments become small `.url` files so the link is
+  not lost. Messages with attachments Graph exposes no content for are reported, not
+  silently dropped.
 - **Streaming:** each Graph page is fetched, converted and appended immediately, so
   the target starts receiving mail while the source is still being read and memory
   stays flat (important for 50k-message mailboxes with attachments). The restart

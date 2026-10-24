@@ -84,6 +84,15 @@ Remote: `origin` -> `git@github.com:psimsa/o365_imap_migration.git` (fork)
 - [x] Real-tenant streaming check: two filtered Inbox messages (2020 range) streamed with
       attachments over `pavel@simsa.cz`.
 
+## Attachments (new)
+
+- [x] `itemAttachment` (attached email, `.eml`) no longer skipped: listed with
+      `$expand=microsoft.graph.itemAttachment/item` and embedded as `message/rfc822`
+      (recursively includes the attached message's own attachments when present).
+- [x] `referenceAttachment` cloud links become `.url` text files.
+- [x] Clearer warning for attachments with no downloadable content.
+- [x] Tests for item/reference attachments and the `$expand` request.
+
 ## Next / open questions
 
 - [ ] Run a real end-to-end trial (`--dry-run`, then `--limit 25`) and tag `1.1.0`.

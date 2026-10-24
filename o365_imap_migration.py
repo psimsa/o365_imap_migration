@@ -26,8 +26,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from email import encoders
+from email import encoders, message_from_string
 from email.mime.base import MIMEBase
+from email.mime.message import MIMEMessage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import format_datetime, parsedate_to_datetime
@@ -53,6 +54,7 @@ CSV_HEADER = ["source_email", "target_server", "target_email", "target_password"
 REQUIRED_ENV = ["SOURCE_CLIENT_ID", "SOURCE_CLIENT_SECRET", "SOURCE_TENANT_ID"]
 TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+ATTACHMENT_EXPAND = "microsoft.graph.itemAttachment/item"
 
 # Fallback mapping for the default folders; anything unmapped goes to INBOX.
 TARGET_FOLDER_MAP = {
@@ -715,9 +717,9 @@ def select_folders(folders, requested):
 
 
 def fetch_attachments(access_token, email_address, message_id):
-    """Fetch attachments for a given message."""
+    """Fetch attachments, expanding attached messages (itemAttachment)."""
     url = (f"{_user_url(email_address)}/messages/{quote(message_id, safe='')}/attachments")
-    return graph_get_all(url, access_token)
+    return graph_get_all(url, access_token, params={"$expand": ATTACHMENT_EXPAND})
 
 
 def iter_source_emails(cfg, source_email, access_token, skip_ids=None, folders=None):
@@ -823,6 +825,15 @@ def _rfc2822_date(value):
     return format_datetime(parsed)
 
 
+def attachment_filename(name, default="attachment", forced_suffix=None):
+    """Sanitizes an attachment name and optionally enforces a suffix."""
+    filename = re.sub(r'[\x00-\x1f\x7f"\\/]', "_", str(name or "")).strip() or default
+    if forced_suffix:
+        stem, _ = os.path.splitext(filename)
+        filename = (stem or default) + forced_suffix
+    return filename
+
+
 def convert_to_rfc822(cfg, msg):
     """Converts a Graph message dictionary to RFC822 format."""
     try:
@@ -854,23 +865,48 @@ def convert_to_rfc822(cfg, msg):
             email_msg = MIMEMultipart()
             email_msg.attach(MIMEText(body, subtype, "utf-8"))
             for attachment in attachments:
-                content_bytes = attachment.get("contentBytes")
-                if not content_bytes:
-                    safe_print(f"Skipping attachment without content: "
-                               f"{attachment.get('name')!r}")
-                    continue
+                name = attachment.get("name")
+                kind = (attachment.get("@odata.type") or "").rsplit(".", 1)[-1]
                 try:
-                    filename = str(attachment.get("name") or "unknown")
-                    filename = filename.replace("\r", "").replace("\n", "").replace('"', "")
+                    content_bytes = attachment.get("contentBytes")
+                    nested_item = attachment.get("item")
+                    source_url = attachment.get("sourceUrl")
 
-                    mime_attachment = MIMEBase("application", "octet-stream")
-                    mime_attachment.set_payload(base64.b64decode(content_bytes))
-                    encoders.encode_base64(mime_attachment)
-                    mime_attachment.add_header(
-                        "Content-Disposition", f'attachment; filename="{filename}"')
-                    email_msg.attach(mime_attachment)
+                    if content_bytes:
+                        mime_attachment = MIMEBase("application", "octet-stream")
+                        mime_attachment.set_payload(base64.b64decode(content_bytes))
+                        encoders.encode_base64(mime_attachment)
+                        mime_attachment.add_header(
+                            "Content-Disposition", "attachment",
+                            filename=attachment_filename(name))
+                        email_msg.attach(mime_attachment)
+
+                    elif isinstance(nested_item, dict):
+                        # An attached email: rebuild it and attach as message/rfc822.
+                        nested = convert_to_rfc822(cfg, nested_item)
+                        if not nested:
+                            safe_print(f"Could not convert attached message {name!r}")
+                            continue
+                        part = MIMEMessage(message_from_string(nested))
+                        part.add_header(
+                            "Content-Disposition", "attachment",
+                            filename=attachment_filename(name, forced_suffix=".eml"))
+                        email_msg.attach(part)
+
+                    elif source_url:
+                        # A cloud link (referenceAttachment): keep the link.
+                        part = MIMEText(f"[InternetShortcut]\nURL={source_url}\n",
+                                        "plain", "utf-8")
+                        part.add_header(
+                            "Content-Disposition", "attachment",
+                            filename=attachment_filename(name, forced_suffix=".url"))
+                        email_msg.attach(part)
+
+                    else:
+                        safe_print(f"Skipping attachment {name!r} "
+                                   f"(type {kind or 'unknown'}, no downloadable content)")
                 except Exception as e:
-                    safe_print(f"Error processing attachment {attachment.get('name')!r}: {e}")
+                    safe_print(f"Error processing attachment {name!r}: {e}")
         else:
             email_msg = MIMEText(body, subtype, "utf-8")
 

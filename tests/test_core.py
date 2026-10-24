@@ -1,5 +1,6 @@
 import json
 import os
+from email import message_from_string
 import ssl
 import tempfile
 import unittest
@@ -269,6 +270,42 @@ class CoreTests(unittest.TestCase):
         board.finish(key, "done")
         self.assertIn("2 done", stream.text)
         self.assertIn("2/2", stream.text)
+
+    def test_item_attachment_is_embedded_as_eml(self):
+        cfg = support.make_cfg(migrate_attachments=True)
+        outer = support.message(1)
+        outer["attachments"] = [{
+            "@odata.type": "#microsoft.graph.itemAttachment",
+            "name": "RE: invoice.eml",
+            "item": support.message(2),
+        }]
+        rfc = mig.convert_to_rfc822(cfg, outer)
+        self.assertIn("Content-Type: message/rfc822", rfc)
+        self.assertIn('filename="RE: invoice.eml"', rfc)
+        self.assertIn("Subject: S2", rfc)
+
+    def test_reference_attachment_becomes_url_file(self):
+        cfg = support.make_cfg(migrate_attachments=True)
+        outer = support.message(1)
+        outer["attachments"] = [{
+            "@odata.type": "#microsoft.graph.referenceAttachment",
+            "name": "shared.eml",
+            "sourceUrl": "https://example.com/shared.eml",
+        }]
+        rfc = mig.convert_to_rfc822(cfg, outer)
+        self.assertIn('filename="shared.url"', rfc)
+        parts = [part for part in message_from_string(rfc).walk()
+                 if part.get_filename() == "shared.url"]
+        self.assertEqual(len(parts), 1)
+        payload = parts[0].get_payload(decode=True).decode("utf-8")
+        self.assertIn("URL=https://example.com/shared.eml", payload)
+
+    def test_fetch_attachments_expands_item_attachments(self):
+        mig.fetch_attachments("token", "u@example.com", "m1")
+        attachment_calls = [params for url, params in support.FakeRequests.calls
+                            if "/attachments" in url]
+        self.assertTrue(attachment_calls)
+        self.assertEqual(attachment_calls[0].get("$expand"), mig.ATTACHMENT_EXPAND)
 
     def test_parent_folder_quote_stripping(self):
         self.assertEqual(mig.normalize_parent_folder("'Office Migration'"),

@@ -76,6 +76,11 @@ Planned release: `1.1.0`. Everything below is on `feature/interactive-tui`
 
 ### Fixed
 
+- Attached emails (`itemAttachment`, e.g. a `.eml` attachment) were skipped with
+  "Skipping attachment without content". Attachments are now listed with
+  `$expand=microsoft.graph.itemAttachment/item`; the attached message is rebuilt and
+  embedded as `message/rfc822`, and cloud-link (`referenceAttachment`) items become
+  `.url` files. The remaining skip warning names the attachment type.
 - Only the first page (10 items) of each folder was migrated; now all pages are read.
 - Nested O365 folders were never migrated; now they are traversed (and mirrored when a
   target parent folder is configured).
