@@ -280,8 +280,12 @@ def normalize_parent_folder(value):
     return "/".join(part.strip() for part in (value or "").split("/") if part.strip())
 
 
-def load_config(env_file=None):
-    """Load settings from a .env file (and the process environment)."""
+def load_config(env_file=None, require_credentials=True):
+    """Load settings from a .env file (and the process environment).
+
+    With ``require_credentials=False`` missing ``SOURCE_*`` values are allowed and
+    returned empty; interactive mode uses that to prompt for them.
+    """
     path = env_file or DEFAULT_ENV
     if env_file and not os.path.exists(path):
         raise MigrationError(f"env file not found: {path}")
@@ -289,19 +293,21 @@ def load_config(env_file=None):
         # An explicitly requested env file wins over the process environment.
         load_dotenv(path, override=bool(env_file))
 
-    missing = [name for name in REQUIRED_ENV if not (os.getenv(name) or "").strip()]
-    if missing:
-        hint = "" if os.path.exists(path) else f" (copy {DEFAULT_ENV}.example to {DEFAULT_ENV} first)"
-        raise MigrationError("missing required setting(s): " + ", ".join(missing) + hint)
+    if require_credentials:
+        missing = [name for name in REQUIRED_ENV if not (os.getenv(name) or "").strip()]
+        if missing:
+            hint = "" if os.path.exists(path) else \
+                f" (copy {DEFAULT_ENV}.example to {DEFAULT_ENV} first)"
+            raise MigrationError("missing required setting(s): " + ", ".join(missing) + hint)
 
     email_format = (os.getenv("EMAIL_FORMAT") or "html").strip().lower()
     if email_format not in ("html", "plain"):
         raise MigrationError(f"EMAIL_FORMAT must be 'html' or 'plain', got {email_format!r}")
 
     return Config(
-        client_id=os.environ["SOURCE_CLIENT_ID"].strip(),
-        client_secret=os.environ["SOURCE_CLIENT_SECRET"].strip(),
-        tenant_id=os.environ["SOURCE_TENANT_ID"].strip(),
+        client_id=(os.getenv("SOURCE_CLIENT_ID") or "").strip(),
+        client_secret=(os.getenv("SOURCE_CLIENT_SECRET") or "").strip(),
+        tenant_id=(os.getenv("SOURCE_TENANT_ID") or "").strip(),
         migrate_attachments=env_bool("MIGRATE_ATTACHMENTS", False),
         email_format=email_format,
         imap_ssl_verify=env_bool("IMAP_SSL_VERIFY", True),
@@ -944,7 +950,7 @@ def migrate_emails(cfg, target_mail, messages, board=None, key=None):
 
 
 def migrate_mailbox(cfg, mailbox, board=None):
-    """Migrates a single mailbox."""
+    """Migrates a single mailbox and returns (migrated, failed)."""
     source_email, target_server, target_email, target_password = mailbox
     safe_print(f"[{source_email}] starting migration to {target_email} ({target_server})")
 
@@ -954,14 +960,14 @@ def migrate_mailbox(cfg, mailbox, board=None):
         messages = fetch_all_emails(cfg, source_email, access_token)
         if not messages:
             safe_print(f"[{source_email}] no messages to migrate.")
-            return
+            return 0, 0
 
         safe_print(f"[{source_email}] fetched {len(messages)} message(s); "
                    f"connecting to {target_server}")
         target_mail = connect_to_target_imap(cfg, target_server, target_email, target_password)
         if target_mail is None:
             safe_print(f"[{source_email}] failed to connect to target IMAP server {target_server}")
-            return
+            return 0, 0
 
         if board is not None:
             key = board.register(source_email, len(messages))
@@ -979,11 +985,13 @@ def migrate_mailbox(cfg, mailbox, board=None):
         else:
             safe_print(f"[{source_email}] finished: {migrated} migrated, {failed} failed "
                        f"-> {target_email}")
+        return migrated, failed
 
     except Exception as e:
         if board is not None and key is not None:
             board.finish(key, "failed")
         safe_print(f"[{source_email}] migration failed: {e}")
+        return 0, 0
 
 
 # Dry run --------------------------------------------------------------------
@@ -1166,6 +1174,8 @@ def parse_args(argv=None):
                         help="comma-separated source folders or paths (subtree match)")
     parser.add_argument("--limit", type=int, metavar="N",
                         help="migrate at most N messages per mailbox (0 = all)")
+    parser.add_argument("-i", "--interactive", action="store_true",
+                        help="guided single-mailbox wizard (needs requirements-tui.txt)")
     return parser.parse_args(argv)
 
 
@@ -1173,6 +1183,10 @@ def main(argv=None):
     global _active_board
 
     args = parse_args(argv)
+
+    if args.interactive:
+        from interactive import run_interactive
+        return run_interactive(args)
 
     try:
         cfg = load_config(args.env_file)
