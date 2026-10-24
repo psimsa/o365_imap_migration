@@ -329,12 +329,20 @@ class CoreTests(unittest.TestCase):
         payload = parts[0].get_payload(decode=True).decode("utf-8")
         self.assertIn("URL=https://example.com/shared.eml", payload)
 
-    def test_fetch_attachments_expands_item_attachments(self):
-        mig.fetch_attachments("token", "u@example.com", "m1")
-        attachment_calls = [params for url, params in support.FakeRequests.calls
-                            if "/attachments" in url]
-        self.assertTrue(attachment_calls)
-        self.assertEqual(attachment_calls[0].get("$expand"), mig.ATTACHMENT_EXPAND)
+    def test_item_attachment_without_inline_item_is_expanded(self):
+        message = support.message(1)
+        message["attachments"] = [{
+            "@odata.type": "#microsoft.graph.itemAttachment",
+            "id": "att-item-1",
+            "name": "nested.eml",
+            # no "item": the nested expand did not come inline
+        }]
+        mig.fill_attachment_content("token", "u@example.com", [message])
+        expand_calls = [params for url, params in support.FakeRequests.calls
+                        if "/attachments/att-item-1" in url]
+        self.assertTrue(expand_calls)
+        self.assertEqual(expand_calls[0].get("$expand"), mig.ATTACHMENT_EXPAND)
+        self.assertIsInstance(message["attachments"][0].get("item"), dict)
 
     def test_parent_folder_quote_stripping(self):
         self.assertEqual(mig.normalize_parent_folder("'Office Migration'"),

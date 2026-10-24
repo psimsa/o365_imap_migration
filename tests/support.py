@@ -1,5 +1,6 @@
 """Shared test helpers: dependency stubs and fake Graph/IMAP backends."""
 
+import base64
 import os
 import sys
 import types
@@ -78,21 +79,86 @@ def message(index, folder_name="Inbox"):
     }
 
 
+def attachment(index, name="a.txt", content=b"content", omit_content=False):
+    return {
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "id": f"att-{index}",
+        "name": name,
+        "size": len(content),
+        "contentType": "application/octet-stream",
+        "isInline": False,
+        **({"contentBytes": base64.b64encode(content).decode()}
+           if not omit_content else {}),
+    }
+
+
 class FakeRequests:
-    """Graph fake: 4 folders (one nested), 3 messages per folder, 2 pages each."""
+    """Graph fake: 4 folders (one nested), 3 messages per folder, 2 pages each.
+
+    Attachment behaviour: message-list requests with ``$expand`` return each
+    message with an ``attachments`` array (fileAttachment with contentBytes,
+    unless the attachment id is in ``omit_content_for``). Content for
+    ``$value`` batch requests comes from ``attachment_content``.
+    """
 
     class RequestException(Exception):
         pass
 
     calls = []
-    message_pages = None  # optional override: list of pages (lists of messages)
+    message_pages = None      # optional override: {folder_id: [page, ...]}
+    omit_content_for = set()  # attachment ids that come back without contentBytes
+    attachment_content = {}   # attachment id -> raw bytes (for $value)
+    fail_pages_with_top_above = None  # simulate Graph 504 for big pages
+    _last_messages_request_had_expand = False
+
+    @classmethod
+    def _with_attachments(cls, msg, params):
+        """Attaches the inline attachments when the request asks for $expand."""
+        if params.get("$expand"):
+            msg = dict(msg)
+            msg_id = int(str(msg["id"])[1:])
+            msg["attachments"] = [
+                attachment(msg_id * 100 + index,
+                           name=f"file-{msg['id']}-{index}.txt",
+                           content=f"content-{msg['id']}-{index}".encode(),
+                           omit_content=(f"att-{msg_id * 100 + index}"
+                                         in cls.omit_content_for))
+                for index in range(1)
+            ]
+        return msg
 
     @classmethod
     def get(cls, url, headers=None, params=None, timeout=None):
         params = dict(params or {})
         cls.calls.append((url, params))
-        if "/attachments" in url:
-            return FakeResponse({"value": [{"name": "a.txt", "contentBytes": "aGk="}]})
+
+        if cls.fail_pages_with_top_above is not None:
+            top = params.get("$top")
+            if top is not None and int(top) > cls.fail_pages_with_top_above:
+                return FakeResponse({"error": {"code": "GatewayTimeout"}}, status=504)
+
+        # Single attachment resource (itemAttachment expansion)
+        if "/attachments/" in url and not url.endswith("/attachments"):
+            attachment_id = url.rsplit("/attachments/", 1)[1].split("?")[0]
+            if attachment_id.startswith("att-item"):
+                return FakeResponse({
+                    "@odata.type": "#microsoft.graph.itemAttachment",
+                    "id": attachment_id,
+                    "name": "nested.eml",
+                    "item": message(99),
+                })
+            return FakeResponse({
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "id": attachment_id,
+                "name": "file.txt",
+                "contentBytes": "ZmlsZQ==",
+            })
+
+        if url.endswith("/attachments"):
+            return FakeResponse({"value": [
+                {"@odata.type": "#microsoft.graph.fileAttachment",
+                 "id": "att-1", "name": "a.txt", "contentBytes": "aGk="}]})
+
         if "/childFolders" in url:
             if "/f1/" in url:
                 return FakeResponse({"value": [{"id": "f1c", "displayName": "Sub",
@@ -110,25 +176,75 @@ class FakeRequests:
             return FakeResponse({"value": [{"id": "f3", "displayName": "Sent Items",
                                             "totalItemCount": 1}]})
         if "/messages" in url:
-            if params.get("$top") == 1:
-                return FakeResponse({"value": [message(1)]})
+            if "/next/" not in url:
+                cls._last_messages_request_had_expand = bool(params.get("$expand"))
+            if "/next/" in url:
+                # nextLink responses carry the query in the URL; the production
+                # code sends no params for them, so the fake must not rely on
+                # params here. Attachments are attached only when the original
+                # request asked for $expand (recorded per call sequence).
+                msg = message(3)
+                if cls._last_messages_request_had_expand:
+                    msg["attachments"] = [
+                        attachment(300 + index,
+                                   name=f"file-m3-{index}.txt",
+                                   content=f"content-m3-{index}".encode(),
+                                   omit_content=(f"att-{300 + index}"
+                                                 in cls.omit_content_for))
+                        for index in range(1)
+                    ]
+                return FakeResponse({"value": [msg]})
             if cls.message_pages is not None:
                 # Deterministic per-folder message lists (for verification tests).
                 folder_id = url.rsplit("/mailFolders/", 1)[1].split("/")[0]
                 pages = cls.message_pages.get(folder_id, [[message(1)]])
-                index = min(len(cls.calls) and sum(
-                    1 for u, _ in cls.calls
-                    if u == url and _ is not None) or 0, len(pages) - 1)
-                page = pages[index]
+                if url.startswith("https://graph.test/next/"):
+                    index = int(url.rsplit("/", 1)[1].split("?")[0].replace("p", ""))
+                else:
+                    index = 0
+                index = min(index, len(pages) - 1)
+                page = [cls._with_attachments(m, params) for m in pages[index]]
                 response = {"value": page}
                 if index < len(pages) - 1:
-                    response["@odata.nextLink"] = f"https://graph.test/next/{folder_id}"
+                    response["@odata.nextLink"] = (
+                        f"https://graph.test/next/{folder_id}?p={index + 1}")
                 return FakeResponse(response)
-            if url == "https://graph.test/next/messages":
-                return FakeResponse({"value": [message(3)]})
-            return FakeResponse({"value": [message(1), message(2)],
-                                 "@odata.nextLink": "https://graph.test/next/messages"})
+            page = [message(1), message(2)]
+            if params.get("$top") == 1:
+                page = page[:1]
+            page = [cls._with_attachments(m, params) for m in page]
+            from urllib.parse import urlencode
+            next_url = "https://graph.test/next/messages"
+            if params:
+                next_url += "?" + urlencode(params)
+            return FakeResponse({"value": page, "@odata.nextLink": next_url})
         raise AssertionError("unexpected Graph URL: " + url)
+
+    @classmethod
+    def post(cls, url, json=None, headers=None, timeout=None):
+        """$batch endpoint: dispatches inner GETs and wraps the bodies."""
+        cls.calls.append((url, {"$batch": True}))
+        responses = []
+        for inner in (json or {}).get("requests", []):
+            inner_url = "https://graph.test" + inner["url"]
+            if inner["url"].endswith("/$value"):
+                attachment_id = inner["url"].rsplit("/attachments/", 1)[1] \
+                    .rsplit("/$value", 1)[0]
+                # Unknown attachments (the broken inline images) return empty
+                # content, exactly like the real Graph endpoint does.
+                content = cls.attachment_content.get(attachment_id, b"")
+                import base64 as _b64
+                responses.append({
+                    "id": inner["id"], "status": 200,
+                    "body": _b64.b64encode(content).decode(),
+                })
+            else:
+                resp = cls.get(inner_url)
+                responses.append({
+                    "id": inner["id"], "status": resp.status_code,
+                    "body": resp.json(),
+                })
+        return FakeResponse({"responses": responses})
 
 
 class FakeIMAP:
@@ -221,10 +337,16 @@ class FakeImaplib:
 def install_fakes():
     FakeRequests.calls = []
     FakeRequests.message_pages = None
+    FakeRequests.omit_content_for = set()
+    FakeRequests.attachment_content = {}
+    FakeRequests.fail_pages_with_top_above = None
+    FakeRequests._last_messages_request_had_expand = False
     FakeIMAP.instances = []
     FakeIMAP.fail_login = False
     mig.requests = FakeRequests
     mig.imaplib = FakeImaplib
+    # The production code uses per-thread keep-alive sessions; the fake acts as one.
+    mig._get_session = lambda: FakeRequests
     return FakeRequests, FakeIMAP
 
 

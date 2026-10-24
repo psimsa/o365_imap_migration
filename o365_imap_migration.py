@@ -34,7 +34,7 @@ from email.header import decode_header, make_header
 from email.mime.text import MIMEText
 from email.utils import format_datetime, parsedate_to_datetime
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 try:
     import requests
@@ -56,6 +56,19 @@ REQUIRED_ENV = ["SOURCE_CLIENT_ID", "SOURCE_CLIENT_SECRET", "SOURCE_TENANT_ID"]
 TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 ATTACHMENT_EXPAND = "microsoft.graph.itemAttachment/item"
+# Expands attachments on a messages-list request, including the nested item of
+# attached messages. fileAttachment contentBytes come inline; large files and
+# itemAttachments are filled in afterwards (see fill_attachment_content).
+MESSAGE_ATTACHMENT_EXPAND = "attachments($expand=microsoft.graph.itemAttachment/item)"
+# Graph $batch accepts at most 20 requests per call.
+GRAPH_BATCH_LIMIT = 20
+# Graph property list for message pages: only what the converter needs.
+MESSAGE_SELECT_PROPS = ["id", "subject", "from", "toRecipients", "ccRecipients",
+                        "bccRecipients", "receivedDateTime", "body"]
+# Never shrink pages below this when a 504 forces it.
+MIN_GRAPH_PAGE_SIZE = 10
+# Per-thread HTTP connection pool size for Graph.
+HTTP_POOL_SIZE = 16
 # Charset declarations inside HTML bodies (rewritten to UTF-8 on conversion).
 META_CHARSET_RE = re.compile(r'(<meta\b[^>]*?\bcharset\s*=\s*["\']?)[^"\'>\s;]+')
 XML_ENCODING_RE = re.compile(r'(<\?xml\b[^>]*?\bencoding\s*=\s*["\'])[^"\']+(["\'])')
@@ -85,6 +98,23 @@ print_lock = threading.Lock()
 # authentication so two threads migrating the same source cannot delete each
 # other's token directory mid-flight.
 auth_lock = threading.Lock()
+_session_local = threading.local()
+
+
+def _get_session():
+    """Per-thread keep-alive HTTP session for Graph (connection pooling).
+
+    A fresh TCP+TLS handshake per request costs ~40-80 ms; reusing connections
+    roughly halves per-request latency and enables parallel fetchers later.
+    """
+    session = getattr(_session_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=HTTP_POOL_SIZE, pool_maxsize=HTTP_POOL_SIZE)
+        session.mount("https://", adapter)
+        _session_local.session = session
+    return session
 _active_board: Optional["ProgressBoard"] = None
 
 
@@ -626,14 +656,20 @@ def _retry_delay(response, attempt):
     return min(2 ** attempt, 30)
 
 
-def graph_get(url, access_token, params=None, timeout=60, max_attempts=5):
-    """Single Graph GET with retry/backoff for throttling and transient errors."""
+def graph_get(url, access_token, params=None, timeout=60, max_attempts=5,
+              immediate_codes=()):
+    """Single Graph GET with retry/backoff for throttling and transient errors.
+
+    ``immediate_codes`` are raised without retrying (used for 504 on oversized
+    pages, where the caller shrinks the page instead of retrying).
+    """
     headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
     last_error = "unknown error"
 
     for attempt in range(1, max_attempts + 1):
         try:
-            response = requests.get(url, headers=headers, params=params, timeout=timeout)
+            response = _get_session().get(url, headers=headers, params=params,
+                                          timeout=timeout)
         except requests.RequestException as e:
             last_error = f"{type(e).__name__}: {e}"
             if attempt == max_attempts:
@@ -648,6 +684,8 @@ def graph_get(url, access_token, params=None, timeout=60, max_attempts=5):
             return response.json()
 
         last_error = f"HTTP {response.status_code}: {response.text[:300]}"
+        if response.status_code in immediate_codes:
+            raise GraphError(f"GET {url} failed: {last_error}")
         if response.status_code not in RETRY_STATUS_CODES:
             raise GraphError(f"GET {url} failed: {last_error}")
         if attempt == max_attempts:
@@ -660,8 +698,68 @@ def graph_get(url, access_token, params=None, timeout=60, max_attempts=5):
     raise GraphError(f"GET {url} failed after {max_attempts} attempts: {last_error}")
 
 
+def graph_batch(access_token, requests_payload, timeout=300, max_attempts=3):
+    """Runs a Microsoft Graph ``$batch`` request (up to 20 GETs per call).
+
+    Returns the list of response objects. Used to fetch attachment content
+    (``$value``) for large files that do not carry inline ``contentBytes``.
+    """
+    headers = {"Authorization": f"Bearer {access_token}",
+               "Content-Type": "application/json"}
+    url = f"{GRAPH_BASE}/$batch"
+    last_error = "unknown error"
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = _get_session().post(url, json={"requests": requests_payload},
+                                           headers=headers, timeout=timeout)
+        except requests.RequestException as e:
+            last_error = f"{type(e).__name__}: {e}"
+            if attempt == max_attempts:
+                break
+            time.sleep(min(2 ** attempt, 30))
+            continue
+
+        if response.status_code == 200:
+            return response.json().get("responses", [])
+
+        last_error = f"HTTP {response.status_code}: {response.text[:300]}"
+        if response.status_code not in RETRY_STATUS_CODES or attempt == max_attempts:
+            break
+        delay = _retry_delay(response, attempt)
+        safe_print(f"Graph $batch returned {response.status_code}; retrying in "
+                   f"{delay:.0f}s ({attempt}/{max_attempts})")
+        time.sleep(delay)
+
+    raise GraphError(f"POST {url} failed after {max_attempts} attempts: {last_error}")
+
+
+def _page_top(url, params):
+    """Current $top of a request (params win, then the URL query string)."""
+    if params and params.get("$top") is not None:
+        return int(params["$top"])
+    for key, value in parse_qsl(urlsplit(url).query, keep_blank_values=True):
+        if key == "$top":
+            return int(value)
+    return None
+
+
+def _with_top(url, params, top):
+    """Returns (url, params) with $top set to ``top``."""
+    if params is not None:
+        params = dict(params)
+        params["$top"] = top
+        return url, params
+    parts = urlsplit(url)
+    query = [(key, value) for key, value in
+             parse_qsl(parts.query, keep_blank_values=True) if key != "$top"]
+    query.append(("$top", str(top)))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                       urlencode(query), parts.fragment)), None
+
+
 def graph_iter(url, access_token, params=None, timeout=60, limit=None,
-               on_page=None, skip_ids=None):
+               on_page=None, skip_ids=None, transform_page=None):
     """Yield a Graph collection page by page, following @odata.nextLink.
 
     Graph returns at most 10 items per page by default, so ignoring
@@ -669,12 +767,31 @@ def graph_iter(url, access_token, params=None, timeout=60, limit=None,
 
     ``skip_ids`` removes already-migrated message IDs *before* the limit is
     applied, so a resumed run with ``--limit N`` fetches N *new* messages.
+    ``transform_page`` post-processes each page's items (e.g. filling in
+    attachment content) before they are yielded.
+
+    A 504 on a paged request means the page was too large: the page size is
+    halved (down to MIN_GRAPH_PAGE_SIZE) and the request retried.
     """
     count = 0
     next_url, next_params = url, params
     while next_url:
-        page = graph_get(next_url, access_token, params=next_params, timeout=timeout)
-        for item in page.get("value", []):
+        top = _page_top(next_url, next_params)
+        try:
+            page = graph_get(next_url, access_token, params=next_params,
+                             timeout=timeout, immediate_codes=(504,))
+        except GraphError as e:
+            if top and top > MIN_GRAPH_PAGE_SIZE and "504" in str(e):
+                next_url, next_params = _with_top(next_url, next_params,
+                                                  max(top // 2, MIN_GRAPH_PAGE_SIZE))
+                safe_print(f"Graph 504 (page too large); retrying with "
+                           f"$top={_page_top(next_url, next_params)}")
+                continue
+            raise
+        items = page.get("value", [])
+        if transform_page is not None:
+            items = transform_page(items)
+        for item in items:
             if skip_ids and str(item.get("id")) in skip_ids:
                 continue
             yield item
@@ -689,10 +806,11 @@ def graph_iter(url, access_token, params=None, timeout=60, limit=None,
 
 
 def graph_get_all(url, access_token, params=None, timeout=60, limit=None,
-                  on_page=None, skip_ids=None):
+                  on_page=None, skip_ids=None, transform_page=None):
     """Materializes :func:`graph_iter` into a list."""
     return list(graph_iter(url, access_token, params=params, timeout=timeout,
-                           limit=limit, on_page=on_page, skip_ids=skip_ids))
+                           limit=limit, on_page=on_page, skip_ids=skip_ids,
+                           transform_page=transform_page))
 
 
 def get_mail_folders(cfg, access_token, user_email):
@@ -749,10 +867,66 @@ def select_folders(folders, requested):
     return selected, missing
 
 
-def fetch_attachments(access_token, email_address, message_id):
-    """Fetch attachments, expanding attached messages (itemAttachment)."""
-    url = (f"{_user_url(email_address)}/messages/{quote(message_id, safe='')}/attachments")
-    return graph_get_all(url, access_token, params={"$expand": ATTACHMENT_EXPAND})
+def fill_attachment_content(access_token, source_email, messages):
+    """Ensures every attachment of every message has downloadable content.
+
+    ``$expand=attachments`` returns fileAttachment ``contentBytes`` inline, but
+    some attachments (large files, certain inline images) come back without
+    them. Those are fetched with ``$value`` in ``$batch`` groups of up to 20 -
+    the batch body is the base64 content, ready for ``contentBytes``. Graph
+    returns 0 bytes for a few broken/empty inline attachments; those stay
+    empty and are reported by the converter.
+
+    ``itemAttachment``\\'s whose nested item did not come inline are expanded
+    with an individual request (rare).
+    """
+    value_jobs = []
+    item_jobs = []
+    for message in messages:
+        for attachment in message.get("attachments") or []:
+            kind = (attachment.get("@odata.type") or "").rsplit(".", 1)[-1]
+            if kind == "fileAttachment" and not attachment.get("contentBytes"):
+                value_jobs.append((message, attachment))
+            elif kind == "itemAttachment" and not attachment.get("item"):
+                item_jobs.append((message, attachment))
+
+    for start in range(0, len(value_jobs), GRAPH_BATCH_LIMIT):
+        chunk = value_jobs[start:start + GRAPH_BATCH_LIMIT]
+        payload = [{
+            "id": str(index),
+            "method": "GET",
+            "url": (f"/users/{quote(source_email, safe='@')}"
+                    f"/messages/{quote(str(message.get('id')), safe='')}"
+                    f"/attachments/{quote(str(attachment.get('id')), safe='')}/$value"),
+        } for index, (message, attachment) in enumerate(chunk)]
+        try:
+            responses = graph_batch(access_token, payload)
+        except GraphError as e:
+            safe_print(f"[{source_email}] could not fetch attachment content: {e}")
+            continue
+        for (message, attachment), response in zip(chunk, responses):
+            body = response.get("body") if isinstance(response, dict) else None
+            if (isinstance(response, dict) and response.get("status") == 200
+                    and isinstance(body, str) and body):
+                attachment["contentBytes"] = body
+            else:
+                status = response.get("status") if isinstance(response, dict) else "?"
+                safe_print(f"[{source_email}] attachment {attachment.get('name')!r} "
+                           f"has no downloadable content (HTTP {status})")
+
+    for message, attachment in item_jobs:
+        url = (f"{_user_url(source_email)}"
+               f"/messages/{quote(str(message.get('id')), safe='')}"
+               f"/attachments/{quote(str(attachment.get('id')), safe='')}")
+        try:
+            full = graph_get(url, access_token, params={"$expand": ATTACHMENT_EXPAND})
+            if isinstance(full.get("item"), dict):
+                attachment["item"] = full["item"]
+        except GraphError as e:
+            safe_print(f"[{source_email}] could not expand attached message "
+                       f"{attachment.get('name')!r}: {e}")
+
+    return messages
 
 
 def iter_source_emails(cfg, source_email, access_token, skip_ids=None, folders=None):
@@ -779,9 +953,21 @@ def iter_source_emails(cfg, source_email, access_token, skip_ids=None, folders=N
         if remaining is not None and remaining <= 0:
             break
 
-        params = {"$top": cfg.graph_page_size}
+        select_props = list(MESSAGE_SELECT_PROPS)
+        params = {"$top": cfg.graph_page_size, "$select": ",".join(select_props)}
         if filter_expression:
             params["$filter"] = filter_expression
+        transform_page = None
+        if cfg.migrate_attachments:
+            # Attachments (with contentBytes) come inline: one request per page
+            # instead of one request per message.
+            select_props.append("attachments")
+            params["$select"] = ",".join(select_props)
+            params["$expand"] = MESSAGE_ATTACHMENT_EXPAND
+
+            def transform_page(items, _source=source_email, _token=access_token):
+                return fill_attachment_content(_token, _source, items)
+
         last_report = [0.0]
         fetched = 0
 
@@ -795,17 +981,12 @@ def iter_source_emails(cfg, source_email, access_token, skip_ids=None, folders=N
             for message in graph_iter(
                     f"{_user_url(source_email)}/mailFolders/{folder['id']}/messages",
                     access_token, params=params, limit=remaining,
-                    on_page=on_page, skip_ids=skip_ids):
+                    on_page=on_page, skip_ids=skip_ids,
+                    transform_page=transform_page):
                 message["folderName"] = folder["displayName"]
                 message["folderPath"] = folder["path"]
-                if cfg.migrate_attachments:
-                    try:
-                        message["attachments"] = fetch_attachments(
-                            access_token, source_email, message["id"])
-                    except GraphError as e:
-                        safe_print(f"[{source_email}] failed to fetch attachments for "
-                                   f"message {message.get('id')}: {e}")
-                        message["attachments"] = []
+                if not message.get("attachments"):
+                    message["attachments"] = []
                 fetched += 1
                 yield message
                 if remaining is not None:
@@ -1615,9 +1796,15 @@ def _sample_message(cfg, access_token, source_email, folders):
     candidates.sort(key=lambda f: f["displayName"] != "Inbox")
 
     folder = candidates[0]
+    select_props = list(MESSAGE_SELECT_PROPS)
+    params = {"$top": 1, "$select": ",".join(select_props)}
+    if cfg.migrate_attachments:
+        select_props.append("attachments")
+        params["$select"] = ",".join(select_props)
+        params["$expand"] = MESSAGE_ATTACHMENT_EXPAND
     page = graph_get(
         f"{_user_url(source_email)}/mailFolders/{folder['id']}/messages",
-        access_token, params={"$top": 1},
+        access_token, params=params,
     )
     messages = page.get("value") or []
     if not messages:
@@ -1627,7 +1814,7 @@ def _sample_message(cfg, access_token, source_email, folders):
     message["folderName"] = folder["displayName"]
     message["folderPath"] = folder["path"]
     if cfg.migrate_attachments:
-        message["attachments"] = fetch_attachments(access_token, source_email, message["id"])
+        fill_attachment_content(access_token, source_email, [message])
     return folder, convert_to_rfc822(cfg, message)
 
 

@@ -855,10 +855,15 @@ class Wizard:
             # system folders such as "Sync Issues".
             candidates.sort(key=lambda item: item["displayName"] != "Inbox")
             folder = candidates[0]
-            params = {"$top": 1}
+            select_props = list(mig.MESSAGE_SELECT_PROPS)
+            params = {"$top": 1, "$select": ",".join(select_props)}
             filter_expression = mig.build_received_filter(self.cfg)
             if filter_expression:
                 params["$filter"] = filter_expression
+            if self.cfg.migrate_attachments:
+                select_props.append("attachments")
+                params["$select"] = ",".join(select_props)
+                params["$expand"] = mig.MESSAGE_ATTACHMENT_EXPAND
             page = mig.graph_get(
                 f"{mig._user_url(self.mailbox.source_email)}"
                 f"/mailFolders/{folder['id']}/messages",
@@ -871,8 +876,8 @@ class Wizard:
             message["folderName"] = folder["displayName"]
             message["folderPath"] = folder["path"]
             if self.cfg.migrate_attachments:
-                message["attachments"] = mig.fetch_attachments(
-                    self.access_token, self.mailbox.source_email, message["id"])
+                mig.fill_attachment_content(
+                    self.access_token, self.mailbox.source_email, [message])
             rfc822 = mig.convert_to_rfc822(self.cfg, message)
             if not rfc822:
                 return Check("Sample message", False, "message conversion failed")
